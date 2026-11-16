@@ -63,7 +63,9 @@ All six are read-only. They look packages up on PyPI, or on the index in
 
 Each tool's arguments, taken from the `description`s in `TOOLS` in `mcp.py`
 (`inputSchema.properties`). Types are JSON types; defaults are shown where the
-tool has one.
+tool has one. `check_lockfile` and `check_dist` read the project's `pyproject.toml`
+(and `.python-version`) as the command line does, so a setting there comes
+before the built-in default.
 
 #### `check_package`
 
@@ -87,10 +89,10 @@ tool has one.
 | `path` | string | required | Absolute path or `file://` URI of the lockfile or project directory (a relative path is looked for in the client's roots if it shares them, else in the server's working directory). |
 | `environment` | string | `default` | The pixi.lock environment to check. Only for pixi.lock inputs. |
 | `python` | string | `[tool.wheelgap] python`, then `.python-version`, else the server's | Target Python version(s), comma-separated, e.g. '3.13' or '3.12,3.14t' (t = free-threaded); 'next' and 'next-t' mean the newest CPython wheelgap knows. |
-| `targets` | array of strings | `[tool.wheelgap] targets`, else the four default platforms | Platforms, e.g. ['linux-aarch64', 'musl-x86_64', 'win-arm64', 'pyodide'], Docker platforms such as 'linux/arm64', or the groups 'all', 'everything' and 'mobile'. `list_targets` gives every name. |
-| `glibc` | string | `2.36` | glibc version for `linux-*` targets, e.g. '2.28' for a RHEL 8 image. |
-| `musl` | string | `1.2` | musl version for `musl-*` (Alpine) targets. |
-| `macos` | string | `14.0` | Oldest macOS version to support. |
+| `targets` | array of strings | `[tool.wheelgap] targets`, then `[tool.uv] required-environments`, else the four default platforms | Platforms, e.g. ['linux-aarch64', 'musl-x86_64', 'win-arm64', 'pyodide'], Docker platforms such as 'linux/arm64', or the groups 'all', 'everything' and 'mobile'. `list_targets` gives every name. |
+| `glibc` | string | `[tool.wheelgap] glibc` or `distro`, else `2.36` | glibc version for `linux-*` targets, e.g. '2.28' for a RHEL 8 image. |
+| `musl` | string | `[tool.wheelgap] musl` or `distro`, else `1.2` | musl version for `musl-*` (Alpine) targets. |
+| `macos` | string | `[tool.wheelgap] macos`, else `14.0` | Oldest macOS version to support. |
 | `pyodide_lock` | string | `[tool.wheelgap] pyodide-lock` | Absolute path or https URL of a Pyodide release's `pyodide-lock.json`. |
 | `offline` | boolean | `false` | Use only the files recorded in the lockfile; never contact the index. |
 
@@ -109,10 +111,10 @@ tool has one.
 | --- | --- | --- | --- |
 | `path` | string | required | Absolute path or `file://` URI of the folder of built files (a relative path is looked for in the client's roots if it shares them, else in the server's working directory). |
 | `python` | string | `[tool.wheelgap] python`, then `.python-version`, else the server's | Target Python version(s), comma-separated, e.g. '3.13' or '3.12,3.14t' (t = free-threaded); 'next' and 'next-t' mean the newest CPython wheelgap knows. |
-| `targets` | array of strings | `[tool.wheelgap] targets`, else the four default platforms | Platforms, e.g. ['linux-aarch64', 'musl-x86_64', 'win-arm64', 'pyodide'], Docker platforms such as 'linux/arm64', or the groups 'all', 'everything' and 'mobile'. `list_targets` gives every name. |
-| `glibc` | string | `2.36` | glibc version for `linux-*` targets, e.g. '2.28' for a RHEL 8 image. |
-| `musl` | string | `1.2` | musl version for `musl-*` (Alpine) targets. |
-| `macos` | string | `14.0` | Oldest macOS version to support. |
+| `targets` | array of strings | `[tool.wheelgap] targets`, then `[tool.uv] required-environments`, else the four default platforms | Platforms, e.g. ['linux-aarch64', 'musl-x86_64', 'win-arm64', 'pyodide'], Docker platforms such as 'linux/arm64', or the groups 'all', 'everything' and 'mobile'. `list_targets` gives every name. |
+| `glibc` | string | `[tool.wheelgap] glibc` or `distro`, else `2.36` | glibc version for `linux-*` targets, e.g. '2.28' for a RHEL 8 image. |
+| `musl` | string | `[tool.wheelgap] musl` or `distro`, else `1.2` | musl version for `musl-*` (Alpine) targets. |
+| `macos` | string | `[tool.wheelgap] macos`, else `14.0` | Oldest macOS version to support. |
 
 #### `diff_lockfiles`
 
