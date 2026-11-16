@@ -59,13 +59,35 @@ All six are read-only. They look packages up on PyPI, or on the index in
   whether the upgrade lost a wheel.
 - `list_targets`: the platform names the other tools accept.
 
+On `pyodide` targets, `check_package` and `check_lockfile` take an optional
+`pyodide_lock` (a path or https URL of a `pyodide-lock.json`, as
+`--pyodide-lock` does), so packages Pyodide ships itself show as `bundled`.
+
+`check_lockfile` also takes an optional `environment` string for
+`pixi.lock` inputs, like the CLI's `--environment`. For example, pass
+`"environment": "test"` to check the `test` environment instead of `default`.
+An unknown environment is a tool error listing the lockfile's environment names.
+
+Pass `check_lockfile`, `check_dockerfile`, `check_dist` and `diff_lockfiles` an absolute path
+or a `file://` URI, since the server's working directory may not be your
+project. If the client shares its
+[roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots),
+a relative path such as `uv.lock` is resolved against the first root that
+contains it.
+
+Tool calls send progress notifications when the client asks for them and don't
+stop the server answering `ping`. A cancelled call sends no more progress and no
+result, but its index lookups still finish before the next call starts.
+
 ### Tool arguments
 
 Each tool's arguments, taken from the `description`s in `TOOLS` in `mcp.py`
 (`inputSchema.properties`). Types are JSON types; defaults are shown where the
 tool has one. `check_lockfile` and `check_dist` read the project's `pyproject.toml`
 (and `.python-version`) as the command line does, so a setting there comes
-before the built-in default.
+before the built-in default: the lockfile's folder for `check_lockfile`, and
+for `check_dist` the nearest folder above the dist folder with a
+`pyproject.toml`.
 
 #### `check_package`
 
@@ -93,8 +115,8 @@ before the built-in default.
 | `glibc` | string | `[tool.wheelgap] glibc` or `distro`, else `2.36` | glibc version for `linux-*` targets, e.g. '2.28' for a RHEL 8 image. |
 | `musl` | string | `[tool.wheelgap] musl` or `distro`, else `1.2` | musl version for `musl-*` (Alpine) targets. |
 | `macos` | string | `[tool.wheelgap] macos`, else `14.0` | Oldest macOS version to support. |
-| `pyodide_lock` | string | `[tool.wheelgap] pyodide-lock` | Absolute path or https URL of a Pyodide release's `pyodide-lock.json`. |
-| `offline` | boolean | `false` | Use only the files recorded in the lockfile; never contact the index. |
+| `pyodide_lock` | string | `[tool.wheelgap] pyodide-lock` (when a pyodide target is checked) | Absolute path or https URL of a Pyodide release's `pyodide-lock.json`. |
+| `offline` | boolean | `[tool.wheelgap] offline`, else `false` | Use only the files recorded in the lockfile; never contact the index. `true` turns it on; `offline = true` in the project can't be turned off from here. |
 
 #### `check_dockerfile`
 
@@ -128,26 +150,6 @@ before the built-in default.
 #### `list_targets`
 
 No arguments.
-
-On `pyodide` targets, `check_package` and `check_lockfile` take an optional
-`pyodide_lock` (a path or https URL of a `pyodide-lock.json`, as
-`--pyodide-lock` does), so packages Pyodide ships itself show as `bundled`.
-
-`check_lockfile` also takes an optional `environment` string for
-`pixi.lock` inputs, like the CLI's `--environment`. For example, pass
-`"environment": "test"` to check the `test` environment instead of `default`.
-An unknown environment is a tool error listing the lockfile's environment names.
-
-Pass `check_lockfile`, `check_dockerfile`, `check_dist` and `diff_lockfiles` an absolute path
-or a `file://` URI, since the server's working directory may not be your
-project. If the client shares its
-[roots](https://modelcontextprotocol.io/specification/2025-06-18/client/roots),
-a relative path such as `uv.lock` is resolved against the first root that
-contains it.
-
-Tool calls send progress notifications when the client asks for them and don't
-stop the server answering `ping`. A cancelled call sends no more progress and no
-result, but its index lookups still finish before the next call starts.
 
 ## Claude Code
 
