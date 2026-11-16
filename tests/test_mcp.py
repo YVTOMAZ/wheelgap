@@ -1811,6 +1811,18 @@ def test_mcp_docs_name_every_tool():
         assert f"`{tool['name']}`" in text
 
 
+def test_mcp_docs_name_every_tool_argument():
+    """docs/mcp.md names every argument each tool's inputSchema accepts, so a new one can't go undocumented."""
+    text = (Path(__file__).resolve().parent.parent / "docs" / "mcp.md").read_text(encoding="utf-8")
+    missing = [
+        f"{tool['name']}.{prop}"
+        for tool in mcp.TOOLS
+        for prop in tool["inputSchema"]["properties"]
+        if f"`{prop}`" not in text
+    ]
+    assert not missing, missing
+
+
 # The 2026-07-28 revision: no handshake; every request carries its version and the client's capabilities in _meta.
 
 MODERN = "2026-07-28"
