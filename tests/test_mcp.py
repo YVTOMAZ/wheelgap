@@ -101,6 +101,7 @@ def test_tools_list_has_valid_schemas():
         "check_dockerfile",
         "check_dist",
         "diff_lockfiles",
+        "explain_install_failure",
         "list_targets",
     }
     for tool in tools.values():

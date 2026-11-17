@@ -21,6 +21,8 @@ Tools (all read-only; they look packages up on PyPI, or the index in WHEELGAP_IN
 - check_dist: what `wheelgap --dist DIR --json` reports for the release about to be uploaded, plus the targets
   the previous release on PyPI had a wheel for that this one drops.
 - diff_lockfiles: what `wheelgap diff OLD NEW --json` reports (the packages that got worse, and new ones with gaps).
+- explain_install_failure: a failed pip or uv install log as text, up to 1 MB, returning, per failed
+  package, the same answer as check_package with --explain and --suggest.
 - list_targets: the platform names the other tools accept.
 
 Paths may be file:// URIs. If the client has the roots capability, the server asks it for roots/list after
@@ -56,6 +58,7 @@ from . import suggest as release_suggest
 from .api import Result, check_package, make_targets, running_python
 from .check import EXPLAIN_LIMIT, Status
 from .dockerfile import DockerfileError, read_dockerfile
+from .install_log import failed_builds
 from .pyodide import PyodideLockError, load_pyodide_lock
 from .sources import SourceError
 from .targets import (
@@ -392,10 +395,35 @@ TOOLS: list[dict[str, Any]] = [
         "annotations": _READ_ONLY,
     },
     {
+        "name": "explain_install_failure",
+        "title": "Explain a failed install log",
+        "description": (
+            "Take a failed pip or uv install log as text (up to 1 MB) and optional 'python' / 'targets', find the "
+            "packages that failed to build the way `--from-log` does, and return, per failed package, its gap, the "
+            "rejected wheels and `--suggest`'s way out in the same shape as `check_package`'s results. The log is "
+            "treated as untrusted text: only the package names and versions read from it are returned, and errors "
+            "don't quote it. " + _STATUS_HELP
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "log": {
+                    "type": "string",
+                    "description": "The text of a failed pip or uv install log, up to 1 MB (measured in UTF-8 bytes).",
+                },
+                "python": _PYTHON_PROP | {"description": _PYTHON_PROP["description"] + " Default: the server's."},
+                "targets": _TARGETS_PROP,
+            },
+            "required": ["log"],
+            "additionalProperties": False,
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
         "name": "list_targets",
         "title": "List target platforms",
         "description": "List the platform names and groups that check_package, check_lockfile, check_dockerfile, "
-        "check_dist and diff_lockfiles accept.",
+        "check_dist, diff_lockfiles and explain_install_failure accept.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "annotations": _READ_ONLY | {"openWorldHint": False},
     },
@@ -897,6 +925,55 @@ def _run_cli(argv: list[str], path: Path, *, positional: bool = True, project: P
     return result
 
 
+_EXPLAIN_CAP = 1 * 1024 * 1024  # 1 MB, measured in UTF-8 bytes, before any processing
+
+
+def _explain_install_failure(args: dict[str, Any]) -> dict[str, Any]:
+    _check_keys("explain_install_failure", args)
+    log = _string(args, "log", required=True) or ""
+    if len(log.encode("utf-8")) > _EXPLAIN_CAP:
+        raise ToolError(f"'log' is larger than 1 MB ({len(log.encode('utf-8'))} bytes); pass a smaller log")
+    versions = _versions(args)
+    try:
+        targets = make_targets(_pythons(args) or None, _platforms(args) or None, **versions)
+    except TargetError as e:
+        raise ToolError(str(e)) from e
+    labels = [t.label(True) for t in targets]
+    other = origin.other_index() is not None
+    try:
+        failures = failed_builds(log, other_index=other)
+    except SourceError as e:
+        if "found no package that failed to build" in str(e):
+            return {
+                "packages": [],
+                "results": [],
+                "failures": [],
+                "targets": labels,
+                "ok": True,
+                "failed": False,
+                "message": "The log names no package that failed to build.",
+            }
+        raise ToolError(str(e)) from e
+    packages: list[dict[str, Any]] = []
+    for name, version in failures:
+        per_args: dict[str, Any] = {k: v for k, v in args.items() if k != "log"}
+        per_args["name"] = name
+        per_args["version"] = version
+        per_args["explain"] = True
+        packages.append(_check_package(per_args))
+    ok = all(p.get("ok", False) for p in packages)
+    response: dict[str, Any] = {
+        "packages": packages,
+        "results": packages,
+        "failures": packages,
+        "targets": labels,
+        "ok": ok,
+    }
+    if len(packages) == 1:
+        response.update(packages[0])
+    return response
+
+
 def _list_targets(args: dict[str, Any]) -> dict[str, Any]:
     _check_keys("list_targets", args)
     return {
@@ -915,6 +992,7 @@ _HANDLERS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "check_dockerfile": _check_dockerfile,
     "check_dist": _check_dist,
     "diff_lockfiles": _diff_lockfiles,
+    "explain_install_failure": _explain_install_failure,
     "list_targets": _list_targets,
 }
 

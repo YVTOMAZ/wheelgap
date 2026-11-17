@@ -1,8 +1,9 @@
 # Set up wheelgap-mcp in your agent
 
 `wheelgap-mcp` is wheelgap's [MCP](https://modelcontextprotocol.io/) server. It
-runs over stdio and gives an agent six read-only tools: `check_package`,
-`check_lockfile`, `check_dockerfile`, `check_dist`, `diff_lockfiles` and `list_targets`. Every
+runs over stdio and gives an agent seven read-only tools: `check_package`,
+`check_lockfile`, `check_dockerfile`, `check_dist`, `diff_lockfiles`, `explain_install_failure`
+and `list_targets`. Every
 client below starts it with the same command:
 
 ```bash
@@ -19,7 +20,7 @@ too.
 
 ## Tools
 
-All six are read-only. They look packages up on PyPI, or on the index in
+All seven are read-only. They look packages up on PyPI, or on the index in
 `WHEELGAP_INDEX_URL`, and like wheelgap the server needs nothing beyond
 `packaging`.
 
@@ -62,6 +63,10 @@ All six are read-only. They look packages up on PyPI, or on the index in
   agent that bumps dependencies can save the old lockfile under its own name
   (`mkdir -p /tmp/old && git show HEAD:uv.lock > /tmp/old/uv.lock`) and ask
   whether the upgrade lost a wheel.
+- `explain_install_failure`: takes a failed pip or uv install log as text (up to 1 MB) plus optional
+  `python` / `targets`, finds the packages that failed to build the way `--from-log` does, and returns,
+  per failed package, its gap, rejected wheels and `--suggest`'s way out in `check_package`'s shape. The
+  log is treated as untrusted text: only the package names and versions read from it are returned.
 - `list_targets`: the platform names the other tools accept.
 
 For example, to check everything `requirements.txt` installs, call
@@ -158,6 +163,14 @@ for `check_dist` the nearest folder above the dist folder with a
 | `new` | string | required | Absolute path to the lockfile (or project directory) after the change. |
 | `python` | string | the server's | Target Python version(s), comma-separated, e.g. '3.13' or '3.12,3.14t' (t = free-threaded); 'next' and 'next-t' mean the newest CPython wheelgap knows. |
 | `targets` | array of strings | the four default platforms | Platforms, e.g. ['linux-aarch64', 'musl-x86_64', 'win-arm64', 'pyodide'], Docker platforms such as 'linux/arm64', or the groups 'all', 'everything' and 'mobile'. `list_targets` gives every name. |
+
+#### `explain_install_failure`
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `log` | string | required | The text of a failed pip or uv install log, up to 1 MB (measured in UTF-8 bytes). |
+| `python` | string | the server's | Target Python version(s), comma-separated, e.g. '3.13' or '3.12,3.14t' (t = free-threaded); 'next' and 'next-t' mean the newest CPython wheelgap knows. |
+| `targets` | array of strings | `linux-x86_64`, `linux-aarch64`, `macos-arm64`, `win-amd64` | Platforms, e.g. ['linux-aarch64', 'musl-x86_64', 'win-arm64', 'pyodide'], Docker platforms such as 'linux/arm64', or the groups 'all', 'everything' and 'mobile'. `list_targets` gives every name. |
 
 #### `list_targets`
 
