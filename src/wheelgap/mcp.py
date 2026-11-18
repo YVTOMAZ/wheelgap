@@ -440,7 +440,7 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "targets": _TARGETS_PROP
                 | {
-                    "description": _TARGETS_PROP["description"]
+                    "description": str(_TARGETS_PROP["description"])
                     + " Pass the platform the install ran on: the log doesn't say."
                 },
                 **_VERSION_PROPS,
