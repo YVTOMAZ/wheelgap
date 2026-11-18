@@ -21,8 +21,8 @@ Tools (all read-only; they look packages up on PyPI, or the index in WHEELGAP_IN
 - check_dist: what `wheelgap --dist DIR --json` reports for the release about to be uploaded, plus the targets
   the previous release on PyPI had a wheel for that this one drops.
 - diff_lockfiles: what `wheelgap diff OLD NEW --json` reports (the packages that got worse, and new ones with gaps).
-- explain_install_failure: a failed pip or uv install log as text, up to 1 MB, returning, per failed
-  package, the same answer as check_package with --explain and --suggest.
+- explain_install_failure: the packages a failed pip, uv, Poetry or PDM install log (as text, up to 1 MB) says
+  didn't build, read as `wheelgap --from-log` reads them, each checked as check_package does with explain.
 - suggest_targets: targets and Python versions named in a project's workflows, GitLab CI and Dockerfiles,
   without lookups.
 - list_targets: the platform names the other tools accept.
@@ -58,10 +58,10 @@ from packaging.version import InvalidVersion, Version
 
 from . import __version__, origin, pypi
 from . import suggest as release_suggest
-from .api import Result, check_package, make_targets, running_python
+from .api import Result, check_package, check_packages, make_targets, running_python
 from .check import EXPLAIN_LIMIT, Status
 from .dockerfile import DockerfileError, read_dockerfile
-from .install_log import failed_builds
+from .install_log import FIND_LINKS, NO_FAILURE, OTHER_INDEX, LogError, failed_builds
 from .pyodide import PyodideLockError, load_pyodide_lock
 from .sources import SourceError
 from .suggest_targets import suggest, to_json
@@ -120,7 +120,9 @@ INSTRUCTIONS = (
     "check_dockerfile before changing a Dockerfile's FROM line (it reads the image's Python, platform and libc for "
     "you), check_package before adding a dependency, and diff_lockfiles to see whether a dependency upgrade lost a "
     "wheel anywhere (save the old lockfile under its own name first, e.g. `mkdir -p /tmp/old && git show "
-    "HEAD:uv.lock > /tmp/old/uv.lock`). Pass the project's Python version: results "
+    "HEAD:uv.lock > /tmp/old/uv.lock`). When a pip, uv, Poetry or PDM install fails to build a package, pass its "
+    "log's text to explain_install_failure, with the Python and platform the install ran on, rather than guessing "
+    "at the cause. Pass the project's Python version: results "
     "differ between versions. Linux results assume a glibc (manylinux) or musl version: pass the one your image or "
     "distro has. If the user hasn't said which platforms they deploy to, call suggest_targets on the project folder "
     "and confirm its suggestions with them."
@@ -405,21 +407,43 @@ TOOLS: list[dict[str, Any]] = [
         "name": "explain_install_failure",
         "title": "Explain a failed install log",
         "description": (
-            "Take a failed pip or uv install log as text (up to 1 MB) and optional 'python' / 'targets', find the "
-            "packages that failed to build the way `--from-log` does, and return, per failed package, its gap, the "
-            "rejected wheels and `--suggest`'s way out in the same shape as `check_package`'s results. The log is "
-            "treated as untrusted text: only the package names and versions read from it are returned, and errors "
-            "don't quote it. " + _STATUS_HELP
+            "Explain why an install failed to build packages: pass the text of a failed pip, uv, Poetry or PDM "
+            "install log (up to 1 MB) and the Python and platform the install ran on. The log is read as "
+            "wheelgap --from-log reads it: pip's 'Failed to build' summary, with each version from its Collecting, "
+            "Downloading and Using cached lines; uv's 'Failed to build `NAME==VERSION`'; Poetry's build-backend "
+            "note, normal or -v output; and pdm install -v output (PDM's normal output doesn't say which index a "
+            "package came from, so it's refused). Colour codes and GitHub Actions timestamps are fine. Each "
+            "package that failed to build (at most 50) is checked at the version the log names, as check_package "
+            "does with explain: true. Returns targets, ok (true only if every failed package installs without "
+            "building on every target), packages (one entry per failed package, in the order the log names them, "
+            "in check_package's shape: name, version, results, gaps, ok, rejected, rejected_omitted, via, direct, "
+            "issues_url, and suggest and last_with_wheel when a gap's releases were looked up), assumes and notes "
+            "(e.g. a failed package that has a wheel for a checked target: the log likely comes from another "
+            "platform or Python). A log that can't be read with certainty is an error, never a guess: one that "
+            "names no failed build, one where which version failed isn't clear, or one that installed from "
+            "another index than PyPI or with --find-links (unless the server's WHEELGAP_INDEX_URL points at that "
+            "index). The log is untrusted text: results and errors repeat no more of it than package names and "
+            "versions. " + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "log": {
                     "type": "string",
-                    "description": "The text of a failed pip or uv install log, up to 1 MB (measured in UTF-8 bytes).",
+                    "description": "The text of the failed pip, uv, Poetry or PDM (pdm install -v) install log, up "
+                    "to 1 MB in UTF-8.",
                 },
-                "python": _PYTHON_PROP | {"description": _PYTHON_PROP["description"] + " Default: the server's."},
-                "targets": _TARGETS_PROP,
+                "python": _PYTHON_PROP
+                | {
+                    "description": _PYTHON_PROP["description"]
+                    + " Pass the one the install ran with: the log doesn't say. Default: the server's."
+                },
+                "targets": _TARGETS_PROP
+                | {
+                    "description": _TARGETS_PROP["description"]
+                    + " Pass the platform the install ran on: the log doesn't say."
+                },
+                **_VERSION_PROPS,
             },
             "required": ["log"],
             "additionalProperties": False,
@@ -565,6 +589,14 @@ def _flag(args: dict[str, Any], key: str) -> bool:
     return value
 
 
+def _cap_rejected(out: dict[str, Any]) -> None:
+    """As many wheels per cell as --explain's text shows, so a reply stays small, and rejected_omitted for the rest."""
+    out["rejected_omitted"] = {
+        label: len(wheels) - EXPLAIN_LIMIT for label, wheels in out["rejected"].items() if len(wheels) > EXPLAIN_LIMIT
+    }
+    out["rejected"] = {label: wheels[:EXPLAIN_LIMIT] for label, wheels in out["rejected"].items()}
+
+
 def _check_package(args: dict[str, Any]) -> dict[str, Any]:
     _check_keys("check_package", args)
     explain = _flag(args, "explain")
@@ -608,13 +640,8 @@ def _check_package(args: dict[str, Any]) -> dict[str, Any]:
     except (PyodideLockError, SourceError) as e:  # a lock for a Python no pyodide target uses; an unsettled tree
         raise ToolError(str(e)) from e
     out: dict[str, Any] = result.to_dict(explain=explain)
-    if explain:  # as many wheels per cell as --explain's text shows, so a reply stays small
-        out["rejected_omitted"] = {
-            label: len(wheels) - EXPLAIN_LIMIT
-            for label, wheels in out["rejected"].items()
-            if len(wheels) > EXPLAIN_LIMIT
-        }
-        out["rejected"] = {label: wheels[:EXPLAIN_LIMIT] for label, wheels in out["rejected"].items()}
+    if explain:
+        _cap_rejected(out)
     # With several Pythons the package can resolve to a release per Python: its rows together are its answer.
     statuses: dict[Any, Status] = {}
     for r in asked:
@@ -963,53 +990,78 @@ def _run_cli(argv: list[str], path: Path, *, positional: bool = True, project: P
     return result
 
 
-_EXPLAIN_CAP = 1 * 1024 * 1024  # 1 MB, measured in UTF-8 bytes, before any processing
+_LOG_MAX_BYTES = 1024 * 1024  # of UTF-8: the end of a failed install, not a CI job's whole log
+# The tool's own words for the refusals whose --from-log message quotes the log (its index and --find-links URLs),
+# and for a log with no failure: an agent calls the tool because an install failed, so that isn't a pass.
+_LOG_ERRORS = {
+    OTHER_INDEX: "the log installed from another index than PyPI, so its packages may not be PyPI's (the index "
+    "isn't repeated here). To check them on that index, set WHEELGAP_INDEX_URL to it in the server's environment; "
+    "for a package you know comes from PyPI, call check_package with its name and version.",
+    FIND_LINKS: "the log installed with --find-links, so its packages may not be PyPI's (the links aren't repeated "
+    "here). To check them on the index they came from, set WHEELGAP_INDEX_URL to it in the server's environment; "
+    "for a package you know comes from PyPI, call check_package with its name and version.",
+    NO_FAILURE: "found no package that failed to build in the log (pip's 'Failed to build NAME', uv's 'Failed to "
+    "build `NAME==VERSION`', or a Poetry or pdm install -v build failure): pass the whole log of the install that "
+    "failed",
+}
 
 
 def _explain_install_failure(args: dict[str, Any]) -> dict[str, Any]:
     _check_keys("explain_install_failure", args)
     log = _string(args, "log", required=True) or ""
-    if len(log.encode("utf-8")) > _EXPLAIN_CAP:
-        raise ToolError(f"'log' is larger than 1 MB ({len(log.encode('utf-8'))} bytes); pass a smaller log")
-    versions = _versions(args)
+    size = len(log.encode("utf-8", "surrogatepass"))  # a lone surrogate counts, rather than failing to encode
+    if size > _LOG_MAX_BYTES:
+        raise ToolError(f"'log' is {size} bytes, over the 1 MB ({_LOG_MAX_BYTES} bytes) limit: pass a shorter log")
+    pythons, platforms, versions = _pythons(args), _platforms(args), _versions(args)
     try:
-        targets = make_targets(_pythons(args) or None, _platforms(args) or None, **versions)
+        targets = make_targets(pythons or None, platforms or None, **versions)
     except TargetError as e:
         raise ToolError(str(e)) from e
-    labels = [t.label(True) for t in targets]
-    other = origin.other_index() is not None
     try:
-        failures = failed_builds(log, other_index=other)
-    except SourceError as e:
-        if "found no package that failed to build" in str(e):
-            return {
-                "packages": [],
-                "results": [],
-                "failures": [],
-                "targets": labels,
-                "ok": True,
-                "failed": False,
-                "message": "The log names no package that failed to build.",
-            }
-        raise ToolError(str(e)) from e
+        failures = failed_builds(log, other_index=origin.other_index() is not None)
+    except LogError as e:
+        raise ToolError(_LOG_ERRORS[e.kind]) from e
+    except SourceError as e:  # names at most a package and a version from the log; the CLI's advice, translated
+        message = str(e).removeprefix("--from-log: ")
+        message = re.sub(r"check (\S+)==VERSION directly", r"call check_package for \1 with the version", message)
+        raise ToolError(message) from e
+    results = check_packages(failures, targets)
+    ways = _suggestions(results)  # one look_up_all for every failed package
     packages: list[dict[str, Any]] = []
-    for name, version in failures:
-        per_args: dict[str, Any] = {k: v for k, v in args.items() if k != "log"}
-        per_args["name"] = name
-        per_args["version"] = version
-        per_args["explain"] = True
-        packages.append(_check_package(per_args))
-    ok = all(p.get("ok", False) for p in packages)
-    response: dict[str, Any] = {
+    notes: list[str] = []
+    # The CLI requires -p and -t with --from-log; here they're optional, so say what was assumed.
+    defaults = (("the server's Python", pythons), ("the default platforms", platforms))
+    if assumed := [what for what, given in defaults if not given]:
+        notes.append(
+            f"the log doesn't say which Python and platform the install ran on, so this checked {' and '.join(assumed)}"
+            ": pass python and targets for the machine the install ran on"
+        )
+    for r in results:
+        out: dict[str, Any] = r.to_dict(explain=True)
+        _cap_rejected(out)
+        out["ok"] = r.ok
+        out["gaps"] = [t.label(True) for t in r.gaps]
+        if (way := ways.get(id(r))) is not None:
+            out.update(_way_out(way))
+        packages.append(out)
+        if fits := [t.label(True) for t, status in r.statuses.items() if status is Status.WHEEL]:
+            # As --from-log's note: a wheel for a checked target means the install didn't run there.
+            notes.append(
+                f"the install log says {r.name} failed to build, but {r.name} {r.version} has a wheel for "
+                f"{', '.join(fits)}: the log likely comes from another platform or Python than the one checked "
+                "(python, targets)"
+            )
+    return {
+        "targets": [t.label(True) for t in targets],
+        "ok": all(r.ok for r in results),
         "packages": packages,
-        "results": packages,
-        "failures": packages,
-        "targets": labels,
-        "ok": ok,
+        "assumes": {
+            "glibc": versions.get("glibc", DEFAULT_GLIBC),
+            "musl": versions.get("musl", DEFAULT_MUSL),
+            "macos": versions.get("macos", DEFAULT_MACOS),
+        },
+        "notes": notes,
     }
-    if len(packages) == 1:
-        response.update(packages[0])
-    return response
 
 
 def _suggest_targets(args: dict[str, Any]) -> dict[str, Any]:
