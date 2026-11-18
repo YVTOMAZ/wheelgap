@@ -31,17 +31,23 @@ it couldn't read is `unknown`, as in a lockfile.
 | --- | --- |
 | `OLD` | the lockfile before the change: a file, a directory, or git's `REF:PATH`; with `--deps`, a pinned `name==1.2` |
 | `NEW` | the lockfile after the change, in the same forms |
-| `-p`, `--python VER` | target Python, repeatable (default: the running Python); `next` and `next-t` work too |
+| `-p`, `--python VER` | target Python, repeatable (default: `python` in `[tool.wheelgap]`, else `.python-version`, else the running Python); `next` and `next-t` work too |
 | `-t`, `--target PLATFORM` | target platform, repeatable |
 | `--glibc X.Y` | glibc version for `linux-*` targets (default: 2.36), e.g. `--glibc 2.28` for RHEL 8 |
 | `--musl X.Y` | musl version for `musl-*` targets (default: 1.2) |
 | `--distro NAME` | default glibc/musl version from a distro, e.g. `--distro ubuntu-22.04`; doesn't select `-t`, and an explicit `--glibc` or `--musl` wins over it |
 | `--macos X.Y` | minimum macOS for `macos-*` targets (default: 14.0) |
+| `--ios X.Y` | minimum iOS for `ios-*` targets (default: 13.0) |
+| `--android-api N` | minimum Android API level for `android-*` targets (default: 24) |
 | `--json` | print one JSON object instead of the text report |
 | `--deps` | `OLD` and `NEW` are pinned releases: resolve and compare their whole trees ([above](#comparing-two-package-versions)) |
 
-The same `-p` and `-t` apply to both lockfiles. `[tool.wheelgap]` and `.python-version` aren't read yet, so pass them
-explicitly. `--advisory` doesn't work with `wheelgap diff` yet.
+The same `-p` and `-t` apply to both lockfiles. `wheelgap diff` reads `[tool.wheelgap]` (`python`, `targets`, `glibc`,
+`musl`, `distro`, `macos`, `ios`, `android-api`), `[tool.uv] required-environments` and `.python-version` from the
+`NEW` input's project directory only, never `OLD`'s, with command-line flags winning over them just as in the main
+command. For a `REF:PATH` input that's the folder of `PATH` in the current directory's working tree, not the copy at
+`REF`, so uncommitted settings apply; with `--deps`, it's the current directory. Keys `diff` doesn't use yet (`ignore`,
+`advisory`, `groups`, ...) are accepted and ignored. `--advisory` doesn't work with `wheelgap diff` yet.
 
 ## What counts as worse
 
@@ -58,8 +64,8 @@ Both lockfiles are checked and packages are matched by name. Per target:
   package counts as a new gap, except a uv `virtual` project, which installs nothing.
 - A package listed more than once (a `uv.lock` fork) takes its worst status on each target.
 
-With a dependency graph (`uv.lock`, Poetry 1.x, or `--deps`), a new or worse transitive package that builds from source or is
-missing names the direct dependency that brings it in, as the main command's table does: `cryptography (via mcp)`,
+With a dependency graph (`uv.lock`, Poetry 1.x, or `--deps`), a new or worse transitive package that builds from source, is
+missing or (after 0.13.0) couldn't be looked up names the direct dependency that brings it in, as the main command's table does: `cryptography (via mcp)`,
 or `(via mcp +1)` when more than one does. The Action's PR comment shows the same.
 
 A requirements-file path with no name (`./pkg`, or `-e ./pkg` without `#egg=`) is matched by its path, so it shows up

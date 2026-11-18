@@ -6,8 +6,8 @@ wheelgap diff [-p VER] [-t PLATFORM] [--glibc X.Y] [--musl X.Y] [--distro NAME] 
 wheelgap mcp            (or wheelgap-mcp)
 ```
 
-`INPUT` is a lockfile, a requirements file, a `pyproject.toml`, a directory, or package specs such as `numpy==2.3.4`
-(default: the current directory). See [Inputs](inputs.md).
+`INPUT` is a lockfile, a requirements file, a `pyproject.toml`, a script with a `# /// script` block (PEP 723), a
+directory, or package specs such as `numpy==2.3.4` (default: the current directory). See [Inputs](inputs.md).
 
 Flags that take a list (`-p`, `-t`, `--extra`, `--group`, `--only-group`, `--ignore`, `--advisory`)
 can be repeated; `-p`, `-t`, `--ignore` and `--advisory` also take comma-separated values. Flags win over
@@ -123,16 +123,19 @@ Include every uv project extra (or every `pyproject.toml` extra, or every Poetry
 
 ### `--group` {#group}
 
-`--group NAME`: include a dependency group (`uv.lock`, Poetry 2.x `poetry.lock`, `pdm.lock`). Repeatable.
+`--group NAME`: include a dependency group (`uv.lock`, Poetry 2.x `poetry.lock`, `pdm.lock`, or a
+`pyproject.toml` `[dependency-groups]` group). Repeatable. With `pyproject.toml`, no group is included by default.
 
 ### `--no-dev` {#no-dev}
 
-Leave out the `dev` group (`uv.lock`, Poetry 2.x `poetry.lock`, `pdm.lock`).
+Leave out the `dev` group (`uv.lock`, Poetry 2.x `poetry.lock`, `pdm.lock`). An error for `pyproject.toml`,
+which includes no group by default.
 
 ### `--only-group` {#only-group}
 
 `--only-group NAME`: check only the named dependency groups, without the project's own dependencies or default
-groups. Repeatable; combine it with `--group` to add more groups, but not with `--extra` or `--all-extras`.
+groups (`uv.lock`, Poetry 2.x `poetry.lock`, `pdm.lock`, or `pyproject.toml` `[dependency-groups]`).
+Repeatable; combine it with `--group` to add more groups, but not with `--extra` or `--all-extras`.
 
 ### `--environment` {#environment}
 
@@ -162,8 +165,8 @@ since PyPI's project of that name may not be yours. If the previous release coul
 comparison didn't run; both notes show even with `-q`, so a gate that didn't compare never passes silently.
 ### `--deps` {#deps}
 
-For package names on the command line, requirements files and dependencies declared in
-`pyproject.toml`, also check what they install.
+For package names on the command line, requirements files, and dependencies declared in
+`pyproject.toml` or a script's `# /// script` block, also check what they install.
 For a project file, this includes any extras you select with `--extra` or `--all-extras`. wheelgap resolves the
 tree for each target from PyPI's metadata: for each requirement, the newest release that meets every constraint on it,
 supports the target's Python and isn't yanked (a yanked release only for an `==` pin), following markers and extras as
@@ -202,7 +205,7 @@ to PyPI. Can't be combined with `--offline`.
 ### `--offline` {#offline}
 
 Never contact an index, for CI and coding agents without network. Inputs that need a lookup (requirements files,
-`pyproject.toml`, `Pipfile.lock`, package names, lockfile entries with no file list, and `pixi.lock`)
+`pyproject.toml`, `Pipfile.lock`, package names, lockfile entries with no file list, `pixi.lock` and `environment.yml`)
 make it exit 2 with an error
 naming the packages, so use a lockfile instead. A `--pyodide-lock` URL is refused too: pass a downloaded copy. The
 [`requires-python` re-check](inputs.md#uvlock) is skipped, with a note that those Pythons may show false gaps.
@@ -242,7 +245,7 @@ A wheel that would fit but whose release was yanked is named with the reason `ya
 
 ### `--from-log` {#from-log}
 
-`--from-log FILE` reads the log of a failed `pip install` or uv install (`-` reads stdin), finds the
+`--from-log FILE` reads a failed pip, uv, Poetry or PDM install log (`-` reads stdin), finds the
 packages that failed to build, and checks each one as `--explain --suggest` does: why no wheel fits, and the release
 that has one. The log doesn't say where the install ran, so pass `-p` and `-t` for that machine (or `--dockerfile` for
 a docker build); without them it's an error.
@@ -271,6 +274,27 @@ in links:` (`--find-links`, with or without `--no-index`) and wheelgap isn't giv
 packages failed. Colour codes and GitHub Actions timestamps are skipped, a UTF-16 log (PowerShell's `>`) is read too,
 and of a longer log only the last 8 MiB is read.
 
+Poetry 2.x logs (captured with 2.5.1; normal or `-v`) are read from Poetry's final build-backend note, `Note: This
+error originates from the build backend, ... issues with NAME (VERSION)`, after its `PEP517 build of a dependency
+failed` header. The backend's own output, which Poetry indents under `|` but can also print at column 0 (what the
+backend writes to stderr), can't be told apart from Poetry's lines, so the note counts only when an earlier Poetry
+operation line names the same package and version, `- Installing NAME (VERSION)` or `- Updating NAME (OLD -> NEW)` (and
+`Downgrading`) for NEW. Poetry's note doesn't name the index, so, as with uv, pass the index the install used with
+`--index-url` when it wasn't PyPI.
+
+PDM logs (captured with 2.29.7) need `pdm install -v`: normal output prints the same name and version for an index,
+URL or local-path dependency, so it's refused with a request to rerun with `-v`. In verbose output the failure counts
+only with all three: PDM's `✖ Install NAME VERSION failed` line, its `Error occurs adding NAME:` with a
+`pdm.exceptions.BuildError` traceback, and the `Running PEP 517 backend to build a wheel for <Link ... (from URL)>`
+line that says which index the sdist came from. A download or other install error is refused rather than reported as a
+build failure, and a package built from another index than PyPI is an error that names the index, unless wheelgap is
+given that index with `--index-url`.
+
+Not read, so they give an error rather than a guess: Poetry 1.x logs, whose `ChefBuildError` diagnostics differ (`found
+no package that failed to build`); a PDM sync that updates a package, whose failure line is `✖ Update NAME OLD -> NEW
+failed`; and a PDM log from a console that can't print Unicode, where PDM writes `x` instead of `✖`. Other Poetry and
+PDM versions whose diagnostics differ are refused too.
+
 A note lists the packages the log says failed, and another says when one has a wheel for a checked target after all:
 then the log likely comes from another platform or Python than `-p` and `-t`. `--no-suggest` turns `--suggest` off.
 `quiet = true` in `[tool.wheelgap]` doesn't apply to it, as `--no-quiet` overrides it; `--quiet` is an error, as with
@@ -284,6 +308,14 @@ the same version that fits a gap's target. Only glibc Linux, macOS and Windows t
 Python can match, and it never changes a status, the summary or the exit code. Only names known to be on PyPI are sent
 to anaconda.org; a run with `--index-url` or `WHEELGAP_INDEX_URL` looks nothing up, and `--offline` refuses the flag.
 See [conda-forge hint](output.md#conda-forge) and [the PyPI-origin rule](how-it-works.md#pypi-origin).
+
+### `--piwheels` {#piwheels}
+
+With `--explain`, also say when [piwheels](https://www.piwheels.org/) has a wheel of the same version for a
+`linux-armv7l` gap (32-bit Raspberry Pi OS). piwheels has no aarch64 wheels, so other targets are never looked up. It
+never changes a status, the summary or the exit code. Only names known to be on PyPI are sent to piwheels.org; a run with `--index-url`
+or `WHEELGAP_INDEX_URL` looks nothing up, and `--offline` refuses the flag.
+See [piwheels hint](output.md#piwheels) and [the PyPI-origin rule](how-it-works.md#pypi-origin).
 
 ### `--notes`, `--no-notes` {#notes}
 
@@ -342,7 +374,8 @@ empty `FILE` is an error, as for `--junit`.
 
 After the usual output, say which gaps a wheel on wheelgap's [gap wheel index](https://wheelgap.github.io/wheels/)
 fills, and how to install from it: a `[tool.uv.index]` and `[tool.uv.sources]` snippet for `pyproject.toml` with a
-uv.lock input, and an `--extra-index-url` line for pip otherwise. A cell counts only when it's `source` or `missing`
+uv.lock input, the same entries for the `# /// script` block of a script, and an `--extra-index-url` line for
+pip otherwise. A cell counts only when it's `source` or `missing`
 (and not `--ignore`d), the package passes [the PyPI-origin rule](how-it-works.md#pypi-origin), and the index has a
 wheel of exactly that version whose tags the target accepts. It reads the index's list from wheelgap.github.io in one
 request that names no package, and only when a gap could use it. A list it could read is kept in the 24-hour
@@ -356,9 +389,35 @@ See [Installing from the gap wheel index](recipes.md#installing-from-the-gap-whe
 With `--explain` too (**after 0.13.0**), each package a gap wheel fills gets a `gap wheel` line under its first filled
 target, naming the targets it fills and saying the wheel is unofficial: built by wheelgap from the PyPI sdist, not from
 the package's maintainers. For inputs pip installs from as they are (a requirements file, a `pyproject.toml`, a pip
-report or package names) it gives the `pip install --extra-index-url` command; for a lockfile it points to the
-`--fix` section, since that lockfile's own tool has to pick the index up. With `--json`, each package gets
+report, an `environment.yml`'s `pip:` list or package names) it gives the `pip install --extra-index-url` command;
+for a lockfile it points to the `--fix` section, since that lockfile's own tool has to pick the index up, and for a
+script likewise, since `uv run` reads the index from its `# /// script` block. With `--json`, each package gets
 [`gap_wheel`](output.md#fix).
+
+### `--print-gap-wheel-snippet` {#print-gap-wheel-snippet}
+
+With [`--fix`](#fix) (**after 0.13.0**), print only the configuration that installs the gap wheels, instead of the
+usual output, for you to copy into your project. It never writes to your project. Comment lines say the wheels are unofficial
+(built by wheelgap from the PyPI sdist, not by the package's maintainers), link to how they're built, and name each
+package and the targets it fills. The exit code is the check's own, so a run with gaps still exits 1 after printing a
+snippet; when no gap wheel fits, stdout is empty.
+
+- For one requirements file or package names on the command line: the `--extra-index-url` line, with pip's
+  dependency-confusion caveat, and for each wheel the `--hash=sha256:` to add to its line if the requirements pin
+  hashes.
+- For one uv.lock: the `[[tool.uv.index]]` (with `explicit = true`) and `[tool.uv.sources]` entries for
+  `pyproject.toml`, with a note for each package uv won't take from the index until it's listed as a direct
+  dependency. Add them to an existing `[tool.uv.sources]` table rather than a second one, then run `uv lock`.
+
+It refuses, with exit code 2 and before any lookup, more than one input and any other input: `pyproject.toml`, a
+script, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `pixi.lock`, a pip report and an `environment.yml`.
+Use `--fix` alone for those. It can't be used with `--explain` (and its add-ons), `--all`, `--from-log`, `--dist`, `--json`, `--markdown`, `--junit`, `--sarif`, `--gitlab-code-quality`, `--badge`,
+`--write-constraints` or `--github-annotations`.
+
+```console
+wheelgap requirements.txt -p 3.14t -t win-arm64 --fix --print-gap-wheel-snippet
+wheelgap uv.lock -p 3.14t -t win-arm64 --fix --print-gap-wheel-snippet
+```
 
 ### `-q`, `--quiet`, `--no-quiet` {#quiet}
 
@@ -385,6 +444,12 @@ a pull request comment. See [Output](output.md#markdown).
 [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html) report to `PATH`, alongside the usual
 output, for GitHub code scanning. It's written even when the check fails, and an empty `PATH` is an error, as for
 `--junit`. See [Output](output.md#sarif) and [CI](ci.md#code-scanning).
+
+### `--gitlab-code-quality` {#gitlab-code-quality}
+
+`--gitlab-code-quality PATH`: also write a GitLab Code Quality JSON report to `PATH`, alongside the usual output,
+even when the check fails. An empty `PATH` is an error. See [Output](output.md#gitlab-code-quality) and
+[GitLab CI](ci.md#gitlab-ci).
 
 ### `--badge` {#badge}
 
@@ -450,11 +515,11 @@ the platforms as JSON. Can't be combined with `--markdown`.
 ### `--suggest-targets` {#suggest-targets}
 
 `--suggest-targets [DIR]`: read the platforms and Pythons that `DIR` (default: the current directory)
-already names in its GitHub Actions workflows and Dockerfiles, print each with the file and line it came from, then a
-`[tool.wheelgap]` snippet to paste into `pyproject.toml`. It only suggests: nothing is changed or checked, and it exits
-0. With `--json`, it prints the same as an object. It can't be combined with `-p`, `-t`, `--dockerfile`, `--build-arg`,
-`--list-targets`, `--markdown` or input files, and a `DIR` that isn't a folder exits 2. What it can't read for sure is
-listed with its file and line rather than guessed. See
+already names in its GitHub Actions workflows, `.gitlab-ci.yml` and Dockerfiles, print each with the file and line it
+came from, then a `[tool.wheelgap]` snippet to paste into `pyproject.toml`. It only suggests: nothing is changed or
+checked, and it exits 0. With `--json`, it prints the same as an object. It can't be combined with `-p`, `-t`,
+`--dockerfile`, `--build-arg`, `--list-targets`, `--markdown` or input files, and a `DIR` that isn't a folder exits 2.
+What it can't read for sure is listed with its file and line rather than guessed. See
 [Suggest targets from your CI and Dockerfiles](targets.md#suggest-targets).
 
 ### `-V`, `--version` {#version}

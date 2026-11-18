@@ -51,7 +51,10 @@ wheelgap -p 3.14t -t all
 # Several Pythons at once, Linux on both architectures
 wheelgap uv.lock -p 3.12,3.13,3.14 -t linux-x86_64,linux-aarch64
 
-# Diagnose failed pip or uv wheel builds
+# Check what a single-file script installs (PEP 723)
+wheelgap example.py --deps -t win-arm64
+
+# Diagnose failed pip, uv, Poetry or PDM (-v) wheel builds
 wheelgap --from-log pip-install.log -p 3.13 -t win-arm64
 
 # Resolve a version range separately for each Python
@@ -93,7 +96,7 @@ python = ["3.13", "3.14t"]
 targets = ["linux-x86_64", "linux-aarch64", "musl-aarch64"]
 ```
 
-Not sure what to put there? `wheelgap --suggest-targets` reads the platforms your CI and Dockerfiles already name and suggests these lines ([how](https://wheelgap.github.io/wheelgap/targets/#suggest-targets)).
+Not sure what to put there? `wheelgap --suggest-targets` reads the platforms your GitHub Actions, GitLab CI and Dockerfiles already name and suggests these lines ([how](https://wheelgap.github.io/wheelgap/targets/#suggest-targets)).
 
 Each cell in the table is one of:
 
@@ -120,9 +123,9 @@ Version ranges select the newest matching release whose `Requires-Python` permit
 resolutions appear in separate rows, including in JSON, with `n/a` for targets using another resolution. See
 [version ranges](https://wheelgap.github.io/wheelgap/how-it-works/#version-ranges) for details.
 
-`--explain` can also show the coverage tracker's notes (`--notes`), what a source build needs (`--build-info`), conda-forge builds that fit (`--conda-forge`) and the nearest newer release with wheels for a gap (`--suggest`). These are opt-in, since they send package names elsewhere ([which names](https://wheelgap.github.io/wheelgap/how-it-works/#pypi-origin)). `--suggest` is on by default when `--deps` resolved every input, since it already looked the whole tree up on PyPI; `--no-suggest` turns it off.
+`--explain` can also show the coverage tracker's notes (`--notes`), what a source build needs (`--build-info`), conda-forge builds that fit (`--conda-forge`), piwheels wheels for a Raspberry Pi gap (`--piwheels`) and the nearest newer release with wheels for a gap (`--suggest`). These are opt-in, since they send package names elsewhere ([which names](https://wheelgap.github.io/wheelgap/how-it-works/#pypi-origin)). `--suggest` is on by default when `--deps` resolved every input, since it already looked the whole tree up on PyPI; `--no-suggest` turns it off.
 
-`--fix` lists the gaps a wheel on wheelgap's [gap wheel index](https://wheelgap.github.io/wheels/) fills (today Windows on ARM for CPython 3.14 and 3.14t), with the `pyproject.toml` snippet for uv or the `--extra-index-url` line for pip. It reads the index's list in one request that names no package, and never changes the exit code ([how](https://wheelgap.github.io/wheelgap/recipes/#installing-from-the-gap-wheel-index)).
+`--fix` lists the gaps a wheel on wheelgap's [gap wheel index](https://wheelgap.github.io/wheels/) fills (today Windows on ARM for CPython 3.14 and 3.14t), with the `pyproject.toml` snippet for uv or the `--extra-index-url` line for pip. It reads the index's list in one request that names no package, and never changes the exit code ([how](https://wheelgap.github.io/wheelgap/recipes/#installing-from-the-gap-wheel-index)); `--print-gap-wheel-snippet` prints just that configuration for one uv.lock or requirements file, without writing it ([details](https://wheelgap.github.io/wheelgap/cli/#print-gap-wheel-snippet)).
 
 The docs cover [inputs and dependency selection](https://wheelgap.github.io/wheelgap/inputs/), [`--explain`](https://wheelgap.github.io/wheelgap/output/#explain), [the `--json` schema](https://wheelgap.github.io/wheelgap/output/#json), [every flag](https://wheelgap.github.io/wheelgap/cli/) and the [recipes](https://wheelgap.github.io/wheelgap/recipes/) for multi-arch images, monorepos and free-threading readiness.
 
@@ -141,7 +144,7 @@ Python versions take a trailing `t` for free-threaded builds (`3.14t`). `--glibc
     args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
 ```
 
-The job fails when a dependency would build from source on a target you ship, for example when a dependency bump drops ARM wheels. The gap table also goes to the run's summary page (set `summary: false` to turn that off). `compare-to: base` fails only when a pull request makes the lockfile worse, and `comment: true` posts the result on the pull request ([details and permissions](https://wheelgap.github.io/wheelgap/ci/#compare-to)). For a release workflow, `dist: dist` runs `--dist` on the files about to be uploaded and fails when the release drops a platform's wheels. [CI](https://wheelgap.github.io/wheelgap/ci/) covers the Action, `--markdown`, `--junit`, `--sarif` and GitLab.
+The job fails when a dependency would build from source on a target you ship, for example when a dependency bump drops ARM wheels. The gap table also goes to the run's summary page (set `summary: false` to turn that off). `compare-to: base` fails only when a pull request makes the lockfile worse, and `comment: true` posts the result on the pull request ([details and permissions](https://wheelgap.github.io/wheelgap/ci/#compare-to)). For a release workflow, `dist: dist` runs `--dist` on the files about to be uploaded and fails when the release drops a platform's wheels. [CI](https://wheelgap.github.io/wheelgap/ci/) covers the Action, `--markdown`, `--junit`, `--sarif` and `--gitlab-code-quality` for GitLab merge request findings.
 
 ## With pre-commit
 
@@ -153,7 +156,7 @@ repos:
       - id: wheelgap
 ```
 
-The hook runs when a lockfile or requirements file changes. Put your targets in `[tool.wheelgap]` in `pyproject.toml` so the hook checks the right platforms.
+The hook runs when a lockfile, requirements file, `pyproject.toml`, `uv.toml` or `.python-version` changes. Put your targets in `[tool.wheelgap]` in `pyproject.toml` so the hook checks the right platforms.
 
 ## From Python
 
@@ -185,7 +188,7 @@ wheelgap ships a **`check-wheels` skill** that teaches coding agents to run it, 
 
 **Codex, Cursor, GitHub Copilot and others:** copy [`integrations/claude-code/skills/check-wheels/`](integrations/claude-code/skills/check-wheels/) into your project's `.agents/skills/` folder. For a Cursor project rule instead, copy [`integrations/cursor/wheelgap.mdc`](integrations/cursor/wheelgap.mdc) to `.cursor/rules/`.
 
-**As an MCP server:** `wheelgap-mcp` lets any agent that speaks the [Model Context Protocol](https://modelcontextprotocol.io/) call wheelgap as a tool, with read-only `check_package`, `check_lockfile`, `check_dockerfile`, `check_dist`, `diff_lockfiles` and `list_targets` tools. For Claude Code:
+**As an MCP server:** `wheelgap-mcp` lets any agent that speaks the [Model Context Protocol](https://modelcontextprotocol.io/) call wheelgap as a tool, with read-only `check_package`, `check_lockfile`, `check_dockerfile`, `check_dist`, `diff_lockfiles`, `suggest_targets` and `list_targets` tools. For Claude Code:
 
 ```bash
 claude mcp add wheelgap -- uvx --from wheelgap wheelgap-mcp
@@ -210,7 +213,7 @@ This checks both lockfiles and lists the packages that got worse on a target (a 
 ## How it works
 
 - **Lockfiles are read offline.** `uv.lock`, `pylock.toml`, `poetry.lock` and `pdm.lock` already record every file published for each pinned version. wheelgap parses the wheel filenames' tags with [`packaging`](https://packaging.pypa.io/) and checks them against the exact tag set each target accepts. That is the same logic pip and uv use to pick a wheel.
-- **`requirements.txt`, `Pipfile.lock`, `pixi.lock`, `pyproject.toml` and bare package names** are looked up on the PyPI JSON API (or your `--index-url`). wheelgap checks the requirements you give it and doesn't resolve dependencies, except for package names, requirements files and `pyproject.toml` inputs with `--deps`, which resolves what they install per target from PyPI's metadata.
+- **`requirements.txt`, `Pipfile.lock`, `pixi.lock`, `environment.yml`, `pyproject.toml`, a script's `# /// script` block and bare package names** are looked up on the PyPI JSON API (or your `--index-url`). wheelgap checks the requirements you give it and doesn't resolve dependencies, except for package names, requirements files, `environment.yml`, `pyproject.toml` and scripts with `--deps`, which resolves what they install per target from PyPI's metadata. For `pyproject.toml`, `--group NAME` also checks a PEP 735 dependency group and `--only-group NAME` checks just the named groups (no group is selected by default).
 - **Environment markers are respected.** A `pywin32 ; sys_platform == 'win32'` dependency won't show up as a Linux gap. For `uv.lock` the dependency graph is walked per target, so transitive platform-specific packages are handled too.
 - **No guessing.** Where wheelgap can't be sure, it says `unknown`, which counts as a gap, rather than guess.
 

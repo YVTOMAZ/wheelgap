@@ -1,7 +1,8 @@
 # Output
 
 wheelgap prints a table by default, or JSON (`--json`) or Markdown (`--markdown`) instead, and can also write a JUnit
-XML file (`--junit PATH`) or a SARIF file (`--sarif PATH`). Notes and errors go to stderr, so the stdout of `--json`
+XML file (`--junit PATH`), a SARIF file (`--sarif PATH`) or a GitLab Code Quality report
+(`--gitlab-code-quality PATH`). Notes and errors go to stderr, so the stdout of `--json`
 and `--markdown` holds only the report.
 
 ## Exit codes
@@ -267,6 +268,55 @@ It's only a hint, so it never changes a status, the summary or the exit code: a 
   down to the subdir, Python, ABI and virtual-package needs of each build of the checked version; `--no-cache` skips
   the cache and `--online` asks again. Failures aren't cached.
 
+### piwheels hint {#piwheels}
+
+`--piwheels` adds a hint to `--explain` (it needs `--explain`): for a package with a gap on `linux-armv7l` (32-bit
+Raspberry Pi OS), it asks [piwheels.org](https://www.piwheels.org/) whether piwheels has a wheel of the same version
+whose tags the target accepts. piwheels has no aarch64 wheels, so no other target is looked up. For example, PyPI has
+no armv7l wheel of numpy 2.5.4, and `wheelgap numpy==2.5.4 -p 3.13 -t linux-armv7l --explain --piwheels` adds:
+
+```text
+piwheels has numpy 2.5.4 for linux-armv7l: --extra-index-url https://www.piwheels.org/simple
+```
+
+A wheel fits when all of these hold:
+- It's of the checked version, in a release that isn't yanked.
+- Its filename is a valid wheel filename of this package and version.
+- Its wheel tags are accepted by the target (`target.accepts()`).
+
+With `--json --explain`, the package gets a `piwheels` object, with the apt packages piwheels lists for those wheels,
+each once:
+`"piwheels": {"name": "numpy", "version": "2.5.4", "wheels": {"linux-armv7l": ["numpy-2.5.4-cp313-cp313-linux_armv7l.whl"]}, "apt": ["libc6", "libgcc-s1", "libgfortran5", "libopenblas0-pthread", "libstdc++6"]}`.
+
+It's only a hint, so it never changes a status, the summary or the exit code.
+
+- **Not from PyPI.** piwheels builds its wheels on Raspberry Pi OS from the PyPI sdist; they aren't from the
+  package's maintainers. A wheel that links to system libraries needs the apt packages piwheels lists for it
+  (`sudo apt install ...`; the `apt` list in `--json`, or the package's page on piwheels.org), and may not work on
+  another armv7l distribution.
+- **With a uv lockfile.** `--extra-index-url` is for pip. For `uv.lock`, add piwheels as an explicit index and send
+  only the package, and only on armv7l, to it (as with the gap wheel index, `[tool.uv.sources]` applies to direct
+  dependencies only, so list the package in `dependencies` too):
+
+  ```toml
+  [[tool.uv.index]]
+  name = "piwheels"
+  url = "https://www.piwheels.org/simple"
+  explicit = true
+
+  [tool.uv.sources]
+  numpy = { index = "piwheels", marker = "platform_machine == 'armv7l'" }
+  ```
+
+- **Which names are sent.** Without the flag nothing is looked up. With it, only names that pass
+  [the PyPI-origin rule](how-it-works.md#pypi-origin) are sent to piwheels.org; a note on stderr names the others. A
+  run with `--index-url`, `index-url` or `WHEELGAP_INDEX_URL` looks nothing up, and `--offline` refuses the flag.
+- **Time and size.** Each request is tried once (with a 15-second socket timeout), at most three at a time, all of
+  them together get 30 seconds, and the first that can't reach piwheels.org stops the rest. Answers over 4 MB
+  are refused. When a lookup fails or is dropped, a note on stderr says no hint isn't a "no".
+- **Cache.** Answers, including "no such package", are cached for 24 hours; `--no-cache` skips the cache and
+  `--online` asks again. Failures aren't cached.
+
 ### Newer releases with wheels {#suggest}
 
 `--suggest` adds, after a package's `--explain` blocks (it needs `--explain`), the lowest newer release with a wheel
@@ -341,7 +391,9 @@ A requirements file, a `pyproject.toml`, a pip report or package names get the
 `--extra-index-url https://wheelgap.github.io/wheels/simple/` line for a requirements file or `pip install`, each wheel's
 `--hash` for requirements that pin hashes, and a reminder that pip treats every index alike. Other lockfiles
 (`pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `pixi.lock`) pin each file, so they get a line saying to add
-the index where the lockfile is made and lock again. Packages wheelgap can't place on PyPI aren't checked, and a note
+the index where the lockfile is made and lock again. A script gets the `[[tool.uv.index]]` and `[tool.uv.sources]`
+lines to add inside its `# /// script` block for `uv run`, commented as the block's lines are, with a note for each
+package that isn't one of the block's own `dependencies` (uv applies sources only to those). Packages wheelgap can't place on PyPI aren't checked, and a note
 on stderr names them. `--markdown` renders the same section with fenced code blocks, and `-q` keeps it. With nothing to fill, a
 note on stderr says so instead (not with `-q`).
 
@@ -389,9 +441,11 @@ gaps = [p["name"] for p in data["packages"] if p["results"].get(key) in ("source
 ```
 
 With `--json --explain`, each package gets `rejected` (`{"file", "reason"}` objects) and `via` (the dependency path),
-both keyed by target label like `results`; `via` is `{}` for inputs with no dependency graph. It also
+both keyed by target label like `results`; `via` is `{}` for inputs with no dependency graph, and (after 0.13.0) also
+covers targets where the package couldn't be looked up. It also
 gets `issues_url`: the package's issue tracker URL from its PyPI metadata, or `null`, and `direct`:
-for each gap target, the direct dependencies that lead to the package, as the table's `cryptography (via mcp)` names
+for each gap target, and (after 0.13.0) each target where the package couldn't be looked up (`unknown`), the direct
+dependencies that lead to the package, as the table's `cryptography (via mcp)` names
 them (`{"win-arm64": ["mcp", "httpx"]}`). `direct` has entries only for uv.lock, Poetry 1.x and `--deps` inputs. It
 leaves out a target where the package is itself a direct dependency, and may leave one out when the lockfile doesn't
 record which direct dependency asked for an extra that leads to the package (Poetry 1.x).
@@ -503,3 +557,20 @@ another SARIF viewer), alongside whatever output mode you use. It has two rules,
 - `partialFingerprints` key a result by file, package and target, not version, so code scanning keeps one alert open
   across lockfile bumps until the gap goes away. A package that one file locks at several versions gets an alert per
   version.
+
+## GitLab Code Quality {#gitlab-code-quality}
+
+`--gitlab-code-quality PATH` writes a [GitLab Code Quality report](https://docs.gitlab.com/ci/testing/code_quality/#code-quality-report-format)
+as a JSON array, alongside the usual output and even when the check fails. Each finding names one package and gap
+target, with check name `wheelgap/source` or `wheelgap/missing` and a SHA-256 fingerprint of the file, canonical
+package name and target (always including the Python), not the version, so GitLab keeps one finding across lockfile
+bumps until the gap goes away. Changing report order or adding another Python doesn't change an existing finding's
+fingerprint, and the same package in two files is two findings. Each fingerprint appears once per report: a package
+that one file locks at several versions gets one finding, for the first.
+
+Severity is `critical` for `missing`, `major` for `source`, `minor` for a source build `--fail-on missing` accepts,
+and `info` on an `--advisory` target. Ignored gaps and `unknown` cells have no finding; failed lookups still fail the
+job. Locations use the same package lines as SARIF, relative to `CI_PROJECT_DIR` (else the current directory), with
+forward slashes. If the reader knows the file but not the package's line, the finding uses line 1. GitLab requires
+a file and line: packages named on the command line and files outside the repository are omitted from this report,
+while their gaps still appear in normal output and affect the exit code. No gaps means an empty array (`[]`).

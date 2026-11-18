@@ -58,7 +58,7 @@ jobs:
 ```
 
 - `args` must then start with the lockfile's path, followed only by what `wheelgap diff` takes: `-p`, `-t`,
-  `--glibc`, `--musl`, `--macos` and `--distro`; anything else exits 2. The step exits 1 when something
+  `--glibc`, `--musl`, `--macos`, `--distro`, `--ios` and `--android-api`; anything else exits 2. The step exits 1 when something
   got worse and 0 when nothing did, but only when `wheelgap diff`'s exit code and its report agree; anything else, such
   as bad input or a run that printed no report, exits 2.
 - The lockfile must exist on both sides: one the pull request adds exits 2. A requirements file that includes others
@@ -162,8 +162,9 @@ repos:
       - id: wheelgap
 ```
 
-The hook runs when `uv.lock`, `poetry.lock`, `pdm.lock`, `pylock.toml`, `Pipfile.lock`, `pixi.lock`, or a
-`requirements*.txt` or `requirements*.lock` file changes. Put your targets in `[tool.wheelgap]` in
+The hook runs when `uv.lock`, `poetry.lock`, `pdm.lock`, `pylock.toml`, `Pipfile.lock`, `pixi.lock`, a
+`requirements*.txt` or `requirements*.lock` file changes, and when `pyproject.toml` (its `[tool.wheelgap]` and
+`[tool.uv]` settings change the answer), `uv.toml` or `.python-version` does. Put your targets in `[tool.wheelgap]` in
 `pyproject.toml` so the hook checks the right platforms. Pass extra options with `args:`, for example
 `args: [--fail-on, missing]`.
 
@@ -227,6 +228,25 @@ start both a branch and a merge request pipeline, each running the job; see
 
 `when: always` keeps the report when the job fails, which is when you want it. See [JUnit XML](output.md#junit-xml)
 for how cells map to test results.
+
+For findings on the lockfile's lines in GitLab merge requests, publish a Code Quality report instead (or alongside
+JUnit):
+
+```yaml
+wheelgap:
+  image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+  script:
+    - uvx wheelgap@latest uv.lock -p 3.13 -t linux-x86_64,linux-aarch64 --gitlab-code-quality gl-code-quality-report.json
+  artifacts:
+    when: always
+    reports:
+      codequality: gl-code-quality-report.json
+```
+
+GitLab shows the findings in the merge request widget on every tier, inline in the merge request's changes view on
+Ultimate, and in the pipeline's Code Quality tab on Premium and above. Run the job on the target branch too: GitLab
+compares its report with the merge request's to identify new and resolved findings. See
+[GitLab Code Quality](output.md#gitlab-code-quality) for severities and location limits.
 
 ## Before a release {#before-a-release}
 

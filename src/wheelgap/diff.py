@@ -43,11 +43,20 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import InvalidName, canonicalize_name
 
 from . import __version__, origin, suggest
-from .api import Result, _check_lockfile, check_packages, make_targets
+from .api import Result, _check_lockfile, check_packages, make_targets, running_python
 from .check import CELL, Row, Status, applies, reachable
+from .cli import find_pyproject, libc_versions, load_config, load_uv_targets, project_dir, read_python_version
 from .logsafe import guarded_output
 from .sources import Source, SourceError
-from .targets import DEFAULT_GLIBC, DEFAULT_MACOS, DEFAULT_MUSL, Target, next_python_note, resolve_distro
+from .targets import (
+    DEFAULT_ANDROID_API,
+    DEFAULT_GLIBC,
+    DEFAULT_IOS,
+    DEFAULT_MACOS,
+    DEFAULT_MUSL,
+    Target,
+    next_python_note,
+)
 
 # Higher is worse. UNKNOWN only orders entries of the same package on one target (see the module docstring).
 RANK = {
@@ -377,6 +386,20 @@ def read_git_ref(ref: str, path: str, into: Path) -> str:
     return str(out)
 
 
+def _config_inputs(new_input: str, *, deps: bool) -> list[str]:
+    """Working-tree path(s) to search for pyproject.toml and .python-version for the NEW input."""
+    if deps:
+        return []
+    if (ref := git_ref_input(new_input)) is not None:
+        working = Path(ref[1])
+        if working.is_file() or working.is_dir():
+            return [str(working)]
+        if working.parent.is_dir():
+            return [str(working.parent)]
+        return []
+    return [new_input]
+
+
 def main(argv: list[str] | None = None, prog: str = "python -m wheelgap.diff") -> int:
     for stream in (sys.stdout, sys.stderr):
         # As in cli.main: write UTF-8 to a non-UTF-8 pipe (Windows cp1252) instead of crashing on ✓ and →.
@@ -407,7 +430,7 @@ def _main(argv: list[str] | None, prog: str) -> int:
         default=[],
         metavar="VER",
         help="target Python, e.g. 3.13, 3.14t, or next / next-t for the newest CPython wheelgap knows "
-        "(repeatable; default: the running Python)",
+        "(repeatable; default: [tool.wheelgap] python, else .python-version, else the running Python)",
     )
     p.add_argument(
         "-t", "--target", action="append", default=[], metavar="PLATFORM", help="target platform (repeatable)"
@@ -420,6 +443,12 @@ def _main(argv: list[str] | None, prog: str) -> int:
         help="default glibc/musl version from a distro, e.g. ubuntu-22.04 (does not select -t)",
     )
     p.add_argument("--macos", metavar="X.Y", help=f"minimum macOS for macos-* targets (default: {DEFAULT_MACOS})")
+    p.add_argument("--ios", metavar="X.Y", help=f"minimum iOS for ios-* targets (default: {DEFAULT_IOS})")
+    p.add_argument(
+        "--android-api",
+        metavar="N",
+        help=f"minimum Android API level for android-* targets (default: {DEFAULT_ANDROID_API})",
+    )
     p.add_argument("--json", action="store_true", help="print one JSON object instead of the text report")
     p.add_argument(
         "--deps",
@@ -428,23 +457,32 @@ def _main(argv: list[str] | None, prog: str) -> int:
     )
     args = p.parse_args(argv)
     try:
-        # Match cli.py precedence: explicit --glibc / --musl wins over --distro.
-        glibc, musl = DEFAULT_GLIBC, DEFAULT_MUSL
-        if args.distro is not None:
-            key, version = resolve_distro(args.distro)
-            if key == "glibc":
-                glibc = version
-            else:
-                musl = version
-        if args.glibc is not None:
-            glibc = args.glibc
-        if args.musl is not None:
-            musl = args.musl
+        config_inputs = _config_inputs(args.new, deps=args.deps)
+        pyproject = find_pyproject(config_inputs)
+        config = load_config(pyproject) if pyproject else {}
+        glibc, musl = libc_versions(args, config)
+        pythons = args.python or config.get("python") or read_python_version(project_dir(config_inputs)) or None
+        platforms = args.target or config.get("targets", [])
+        if not platforms and pyproject:
+            platforms = load_uv_targets(pyproject, pythons or [running_python()])
+            if platforms:
+                note = (
+                    f"wheelgap: note: targets from {pyproject} [tool.uv] required-environments: {', '.join(platforms)}"
+                )
+                if any(p.startswith("musl-") for p in platforms):
+                    note += "; Linux markers select both glibc and musl targets"
+                print(note, file=sys.stderr)
         targets = make_targets(
-            args.python or None, args.target or None, glibc=glibc, musl=musl, macos=args.macos or DEFAULT_MACOS
+            pythons,
+            platforms or None,
+            glibc=glibc,
+            musl=musl,
+            macos=args.macos or config.get("macos", DEFAULT_MACOS),
+            ios=args.ios or config.get("ios", DEFAULT_IOS),
+            android_api=args.android_api or config.get("android-api", DEFAULT_ANDROID_API),
         )
-        if note := next_python_note(args.python):
-            print(f"wheelgap: note: {note}", file=sys.stderr)
+        if next_note := next_python_note(pythons or []):
+            print(f"wheelgap: note: {next_note}", file=sys.stderr)
         sides = []
         sources = []
         rows: list[Row] = []

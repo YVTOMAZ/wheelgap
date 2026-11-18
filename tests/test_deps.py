@@ -5,6 +5,7 @@ import json
 import re
 import urllib.error
 from collections import Counter
+from threading import Barrier
 
 import pytest
 from packaging.requirements import Requirement
@@ -57,6 +58,7 @@ INDEX = {
     "pa": {"1.0": release(["pc>=2.0b1"])},
     "pb": {"1.0": release(["pc"])},
     "pc": {"1.0": release(), "2.0": release(), "2.1b1": release()},
+    "urldep": {"1.0": release(["c @ https://files.example/c-1.0.tar.gz"])},  # c from a direct URL
     # noarm 2.0 has only a Linux wheel and no sdist, so pip on Windows on ARM installs 1.0; nowhere never installs.
     "noarm": {"1.0": release(files=(WIN_ARM,)), "2.0": release(files=(LINUX,), sdist=False)},
     "nowhere": {"1.0": release(files=(LINUX,), sdist=False), "2.0": release(files=(LINUX,), sdist=False)},
@@ -164,6 +166,92 @@ def test_index_answers_are_shared_between_targets(index):
     asked = len(index)
     resolver.resolve([Requirement("app==1.0")], LIN)
     assert len(index) == asked
+
+
+@pytest.mark.parametrize(
+    "specs,constraints",
+    [
+        (["app", "plain", "sdistonly", "agree", "differ", "missing"], {}),
+        (["a", "b", "app"], {}),
+        (["x", "y", "app"], {}),
+        (["c>=2", "c<2", "app"], {}),
+        (["c>=2", "app"], {"c": {"<2"}}),
+        (["pa", "pb"], {}),
+        (["urldep", "a"], {}),  # c is a direct URL first, so the walk never looks up a's c>=1 either
+    ],
+)
+def test_prefetch_keeps_results_and_request_counts_identical(index, specs, constraints):
+    roots = [Requirement(spec) for spec in specs]
+
+    def run(prefetch):
+        index.clear()
+        resolver = Resolver(prefetch=prefetch)
+        try:
+            result = resolver.resolve(roots, WIN, constraints)
+        except DepsError as error:
+            result = str(error)
+        return result, Counter(index)
+
+    sequential, sequential_calls = run(False)
+    parallel, parallel_calls = run(True)
+    assert parallel == sequential
+    assert parallel_calls == sequential_calls
+    assert all(count == 1 for count in parallel_calls.values())
+
+
+def test_prefetch_fetches_sibling_metadata_concurrently(index, monkeypatch):
+    barrier = Barrier(2, timeout=5)
+    fetch_text = pypi.fetch_text
+
+    def together(url, **kwargs):
+        if "/a-" in url or "/b-" in url:
+            barrier.wait()
+        return fetch_text(url, **kwargs)
+
+    monkeypatch.setattr(pypi, "fetch_text", together)
+    tree = Resolver().resolve([Requirement("a"), Requirement("b")], WIN)
+    assert tree.errors == {}
+    assert tree.chosen["c"] == "1.5"
+
+
+def test_prefetch_metadata_failure_does_not_fetch_unused_platform_wheel(index, monkeypatch):
+    fetch_text = pypi.fetch_text
+
+    def broken(url, **kwargs):
+        if "/agree-" in url and WIN_AMD in url:
+            index.append(url)
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        return fetch_text(url, **kwargs)
+
+    monkeypatch.setattr(pypi, "fetch_text", broken)
+    roots = [Requirement("agree"), Requirement("app")]
+    sequential = Resolver(prefetch=False).resolve(roots, WIN)
+    sequential_calls = Counter(index)
+    index.clear()
+    parallel = Resolver().resolve(roots, WIN)
+    assert parallel == sequential
+    assert Counter(index) == sequential_calls
+
+
+def test_prefetch_does_not_refetch_cached_sdist_requirements(index):
+    resolver = Resolver()
+    resolver.requires("sdistonly", "1.0", WIN)
+    index.clear()
+    resolver.resolve([Requirement("sdistonly")], WIN)
+    assert not any("/sdistonly/" in url for url in index)
+
+
+def test_prefetch_stops_before_the_package_limit(index, monkeypatch):
+    monkeypatch.setattr(deps, "MAX_PACKAGES", 1)
+    roots = [Requirement("a"), Requirement("b"), Requirement("app")]
+
+    def run(prefetch):
+        index.clear()
+        with pytest.raises(DepsError, match="more than 1 packages"):
+            Resolver(prefetch=prefetch).resolve(roots, WIN)
+        return Counter(index)
+
+    assert run(True) == run(False)
 
 
 def test_cli_checks_what_the_names_install(index, capsys):
@@ -796,6 +884,61 @@ def test_deps_json_explain_direct_extra_only_names_the_requester(index, capsys):
     assert crypt["direct"] == {"win-arm64": ["app"]}
 
 
+def test_deps_names_the_direct_requirement_of_a_package_whose_lookup_failed(index, monkeypatch, capsys, tmp_path):
+    # #453: "flaky" can't be looked up, so it's unknown, but the table and --junit still name what pulls it in.
+    monkeypatch.setitem(INDEX, "usesflaky", {"1.0": release(["flaky"])})
+    monkeypatch.setitem(INDEX, "alsoflaky", {"1.0": release(["flaky"])})
+    fetch_json = pypi.fetch_json
+
+    def failing(url, *args, **kwargs):
+        if url.startswith(f"{pypi.index_url()}/flaky/"):
+            raise urllib.error.HTTPError(url, 503, "Service Unavailable", {}, None)  # type: ignore[arg-type]
+        return fetch_json(url, *args, **kwargs)
+
+    monkeypatch.setattr(pypi, "fetch_json", failing)
+    roots = [Requirement("usesflaky"), Requirement("c")]
+    resolver = Resolver()
+    tree = resolver.resolve(roots, WIN)
+    assert "flaky" in tree.errors and "flaky" not in tree.chosen
+    assert deps._direct_roots(tree, roots, resolver, WIN) == {"flaky": ("usesflaky",)}
+    for display in ([], ["--markdown"]):
+        args = ["usesflaky", "c", "--deps", "-p", "3.14", "-t", "win-arm64", "--no-cache", "--color", "never"]
+        assert main([*args, *display]) == 1
+        assert "flaky (via usesflaky)" in capsys.readouterr().out
+    report = tmp_path / "report.xml"
+    assert main([*args, "--junit", str(report)]) == 1
+    capsys.readouterr()
+    assert "(via usesflaky)" in report.read_text(encoding="utf-8")
+    # --json --explain names it too: `direct`, and `via` where the tree has a path (#453).
+    assert main([*args, "--json", "--explain"]) == 1
+    flaky = next(p for p in json.loads(capsys.readouterr().out)["packages"] if p["name"] == "flaky")
+    assert flaky["results"] == {"win-arm64": "unknown"}
+    assert flaky["direct"] == {"win-arm64": ["usesflaky"]}
+    assert flaky["via"] == {"win-arm64": ["usesflaky", "flaky"]}
+    assert flaky["rejected"] == {}  # nothing to explain: no files were read
+    both = [Requirement("usesflaky"), Requirement("alsoflaky")]
+    tree = resolver.resolve(both, WIN)
+    assert sorted(deps._direct_roots(tree, both, resolver, WIN)["flaky"]) == ["alsoflaky", "usesflaky"]
+    # The GitHub annotation names the owner and sits on its line, as a transitive gap's does.
+    (tmp_path / "requirements.txt").write_text("c\nusesflaky\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    files = [str(tmp_path / "requirements.txt"), "--deps", "-p", "3.14", "-t", "win-arm64", "--no-cache"]
+    assert main([*files, "--github-annotations"]) == 1
+    (line,) = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("::") and "title=flaky" in ln]
+    assert line.startswith("::error file=requirements.txt,line=2,") and "(via usesflaky)" in line
+
+
+def test_deps_names_the_direct_requirement_of_a_package_with_no_release_for_the_python(index, monkeypatch):
+    # #453: "toonew" has no release for 3.14, so it's never chosen, but it still gets its owner.
+    monkeypatch.setitem(INDEX, "toonew", {"1.0": release(requires_python=">=3.15")})
+    monkeypatch.setitem(INDEX, "usestoonew", {"1.0": release(["toonew"])})
+    roots = [Requirement("usestoonew")]
+    resolver = Resolver()
+    tree = resolver.resolve(roots, WIN)
+    assert "toonew" in tree.errors and "toonew" not in tree.chosen
+    assert deps._direct_roots(tree, roots, resolver, WIN) == {"toonew": ("usestoonew",)}
+
+
 def test_diff_deps_detects_a_new_transitive_gap_on_upgrade(index, monkeypatch, capsys):
     from wheelgap.diff import main as diff_main
 
@@ -896,3 +1039,12 @@ def test_diff_deps_extras_and_index_variables(index, monkeypatch, capsys):
     monkeypatch.setenv("UV_INDEX_URL", "https://example.com/simple")
     assert diff_main(args) == 2
     assert json.loads(capsys.readouterr().out)["error"]["type"] == "SourceError"
+
+
+def test_script_deps_resolve_what_it_installs(index, capsys, tmp_path):
+    script = tmp_path / "example.py"
+    script.write_text('# /// script\n# dependencies = ["app==1.0"]\n# ///\n', encoding="utf-8")
+    assert main([str(script), "--deps", "-p", "3.14", "-t", "win-arm64", "--json"]) == 1
+    out, err = capsys.readouterr()
+    assert {p["name"] for p in json.loads(out)["packages"]} == {"app", "lib", "crypt", "winonly"}
+    assert "direct dependencies only" not in err

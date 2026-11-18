@@ -1,5 +1,6 @@
 import json
 import platform
+import shutil
 import sys
 import sysconfig
 from pathlib import Path
@@ -724,6 +725,26 @@ def test_bad_pyproject_exit_2(capsys, fixtures, tmp_path):
     (tmp_path / "pyproject.toml").write_text("[tool.wheelgap]\nglibc = 2.31\n")
     code, _, err = run(capsys, str(tmp_path))
     assert code == 2 and "glibc must be a string" in err
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_missing_requirements_in_is_not_a_pypi_package(capsys, tmp_path, monkeypatch, fake_pypi, as_json):
+    # A mistyped .in file is a missing input, not a requirement to query on PyPI.
+    monkeypatch.chdir(tmp_path)
+    args = ["requirements-dev.in", "-p", "3.13", "-t", "linux-x86_64"]
+    if as_json:
+        args.append("--json")
+    code, out, err = run(capsys, *args)
+    assert code == 2
+    assert "requirements-dev.in: no such file" in err
+    assert not fake_pypi
+    if as_json:
+        assert json.loads(out)["error"] == {
+            "type": "SourceError",
+            "message": "requirements-dev.in: no such file",
+        }
+    else:
+        assert not out
 
 
 def test_json_reports_input_errors_on_stdout(capsys, fixtures, tmp_path):
@@ -2235,6 +2256,7 @@ def _assert_matches_output_schema(data):
             "bundled",
             "bundled_version_differs",
             "conda_forge",
+            "piwheels",
             "suggest",
             "last_with_wheel",
             "gap_wheel",
@@ -2268,6 +2290,11 @@ def _assert_matches_output_schema(data):
         if "conda_forge" in pkg:  # a hint for some of the targets in rejected, never an empty one
             assert pkg["conda_forge"]["builds"] and set(pkg["conda_forge"]["builds"]) <= set(pkg["rejected"])
             assert all(pkg["conda_forge"]["builds"].values())
+        if "piwheels" in pkg:  # a hint for some of the targets in rejected, never an empty one
+            assert set(pkg["piwheels"]) == {"name", "version", "wheels", "apt"}
+            assert all(isinstance(a, str) for a in pkg["piwheels"]["apt"])
+            assert pkg["piwheels"]["wheels"] and set(pkg["piwheels"]["wheels"]) <= set(pkg["rejected"])
+            assert all(pkg["piwheels"]["wheels"].values())
         for note in pkg.get("notes", []):
             assert set(note["targets"]) <= set(pkg.get("rejected", {})), "notes cover gap targets only"
         for label, result in pkg.get("build_lab", {}).items():  # source cells only, for the checked release
@@ -2665,8 +2692,9 @@ def test_pyproject_extra_adds_optional_dependencies(capsys, fake_pypi, tmp_path,
     "text,flags,error",
     [
         (LIB_PYPROJECT, ["--extra", "docs"], "unknown extras: docs"),
-        (LIB_PYPROJECT, ["--group", "dev"], "don't apply to pyproject.toml"),
-        (LIB_PYPROJECT, ["--no-dev"], "don't apply to pyproject.toml"),
+        (LIB_PYPROJECT, ["--group", "dev"], "unknown groups: dev"),
+        (LIB_PYPROJECT, ["--group", "zeta", "--only-group", "alpha"], "unknown groups: alpha, zeta"),
+        (LIB_PYPROJECT, ["--no-dev"], "--no-dev doesn't apply to pyproject.toml"),
         ('[project]\nname = "x"\ndynamic = ["dependencies"]\n', [], "dependencies is dynamic"),
         (
             '[project]\nname = "x"\ndependencies = []\ndynamic = ["optional-dependencies"]\n',
@@ -2682,6 +2710,112 @@ def test_pyproject_input_errors_exit_2(capsys, fake_pypi, tmp_path, text, flags,
     assert code == 2
     assert error in err
     assert fake_pypi == []  # nothing was looked up
+
+
+@pytest.mark.parametrize(
+    "flags,expected",
+    [
+        ([], {"ranged", "fastlib"}),
+        (["--group", "test"], {"ranged", "fastlib", "nowheels"}),
+        (["--only-group", "test"], {"nowheels"}),
+        (["--only-group", "test", "--group", "docs"], {"nowheels", "purewheel"}),
+        (["--group", "QA_Group"], {"ranged", "fastlib", "nowheels", "purewheel"}),
+        # A requirement on the project itself installs the project: its dependencies, plus any extra it names.
+        (["--only-group", "self"], {"ranged", "fastlib", "nowheels"}),
+        (["--only-group", "bare-self"], {"ranged", "fastlib"}),
+        (["--only-group", "via-alias"], {"nowheels", "purewheel"}),  # a non-normalized include-group name
+    ],
+)
+def test_pyproject_dependency_groups(capsys, fake_pypi, tmp_path, flags, expected):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        LIB_PYPROJECT + "\n[dependency-groups]\n"
+        'test = ["nowheels", "nowheels"]\ndocs = ["purewheel==3.1"]\n'
+        'qa-group = [{include-group = "test"}, {include-group = "docs"}]\n'
+        'self = ["MyLib[test]"]\nbare-self = ["mylib"]\nvia-alias = [{include-group = "QA_Group"}]\n',
+        encoding="utf-8",
+    )
+    code, out, _ = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64", "--json", *flags)
+    assert code == 1
+    rows = json.loads(out)["packages"]
+    assert {row["name"] for row in rows} == expected
+    assert len(rows) == len(expected)
+    assert not any("mylib" in url.lower() for url in fake_pypi)
+
+
+@pytest.mark.parametrize(
+    "groups,flags,error",
+    [
+        ('test = [{include-group = "other"}]\nother = [{include-group = "test"}]', [], "cycle"),
+        ('test = [{include-group = "absent"}]', [], "dependency group 'test' includes unknown group 'absent'"),
+        ('test = [{include-group = "test"}]', [], "cycle"),
+        ('test = ["-e ."]', [], "can't parse requirement '-e .'"),
+        ("test = [42]", [], "entry"),
+        ("test = [{include-group = 42}]", [], "entry"),
+        ('test = [{include-group = "other", unexpected = true}]', [], "entry"),
+        ('test = "nowheels"', [], "list"),
+        ("test = []\nTest = []", [], "once normalized"),
+        ("test = []", ["--only-group", "test", "--extra", "test"], "cannot be combined"),
+    ],
+)
+def test_pyproject_dependency_group_errors(capsys, fake_pypi, tmp_path, groups, flags, error):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(LIB_PYPROJECT + "\n[dependency-groups]\n" + groups, encoding="utf-8")
+    code, _, err = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64", "--group", "test", *flags)
+    assert code == 2 and error in err
+    assert not fake_pypi
+
+
+def test_pyproject_dependency_groups_are_validated_only_when_selected(capsys, fake_pypi, tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        LIB_PYPROJECT + "\n[dependency-groups]\n"
+        'test = ["nowheels"]\nbroken = [42]\nnotalist = "x"\nloop = [{include-group = "loop"}]\n'
+        'missing = [{include-group = "absent"}]\nunparsable = ["-e ."]\n',
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64", "--json", "--group", "test")
+    assert code == 1, err
+    assert {row["name"] for row in json.loads(out)["packages"]} == {"ranged", "fastlib", "nowheels"}
+
+
+def test_pyproject_dependency_group_marker_is_checked_per_target(capsys, fake_pypi, tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text(
+        '[project]\nname = "mylib"\ndependencies = []\n[dependency-groups]\n'
+        'win = ["winonly; sys_platform == \'win32\'", "purewheel==3.1"]\n',
+        encoding="utf-8",
+    )
+    code, out, _ = run(capsys, str(path), "-p", "3.13", "-t", "linux-x86_64,win-amd64", "--json", "--group", "win")
+    assert code == 0
+    rows = {row["name"]: row for row in json.loads(out)["packages"]}
+    assert rows["winonly"]["results"] == {"linux-x86_64": "n/a", "win-amd64": "wheel"}
+    assert rows["purewheel"]["results"] == {"linux-x86_64": "wheel", "win-amd64": "wheel"}
+
+
+def test_pyproject_and_uv_lock_take_the_same_group(capsys, fake_pypi, fixtures, tmp_path):
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "locked").mkdir()
+    shutil.copy(fixtures / "uvselect" / "uv.lock", tmp_path / "locked")
+    path = tmp_path / "lib" / "pyproject.toml"
+    path.write_text(
+        LIB_PYPROJECT + '\n[dependency-groups]\ndocs = ["purewheel==3.1"]\ntest = ["nowheels"]\n', encoding="utf-8"
+    )
+    lock = tmp_path / "locked" / "uv.lock"
+    code, out, err = run(capsys, str(path), str(lock), "-p", "3.13", "-t", "linux-x86_64", "--json", "--group", "docs")
+    assert code == 1, err
+    names = {row["name"] for row in json.loads(out)["packages"]}
+    assert {"ranged", "fastlib", "purewheel", "common", "docstool"} <= names
+    assert not names & {"nowheels", "gpu"}  # neither the pyproject.toml's test group nor the lock's gpu extra
+
+
+@pytest.mark.usefixtures("index")
+def test_pyproject_dependency_group_resolves_tree(capsys, tmp_path):
+    path = tmp_path / "pyproject.toml"
+    path.write_text('[project]\nname = "mylib"\n[dependency-groups]\ntest = ["app"]\n', encoding="utf-8")
+    code, out, _ = run(capsys, str(path), "--group", "test", "--deps", "-p", "3.14", "-t", "win-arm64", "--json")
+    assert code == 1
+    assert {row["name"] for row in json.loads(out)["packages"]} == {"app", "lib", "crypt", "winonly"}
 
 
 def test_pyproject_self_reference_in_dependencies_is_not_looked_up(capsys, fake_pypi, tmp_path):
@@ -4152,3 +4286,137 @@ def test_json_explain_direct_without_a_graph_and_without_explain(capsys, tmp_pat
     code, out, _ = run(capsys, str(tmp_path / "uv.lock"), "-p", "3.13", "-t", "linux-x86_64", "--offline", "--json")
     assert code == 1
     assert all("direct" not in p for p in json.loads(out)["packages"])
+
+
+SCRIPT_METADATA = '# /// script\n# dependencies = ["nowheels==0.9"]\n# requires-python = ">=3.13"\n# ///\n'
+
+
+def test_script_input_checks_dependencies(capsys, fake_pypi, tmp_path):
+    script = tmp_path / "example.py"
+    script.write_text(SCRIPT_METADATA + 'print("hello")\n', encoding="utf-8")
+    code, out, err = run(capsys, str(script), "-p", "3.13", "-t", "win-arm64")
+    assert code == 1
+    assert "nowheels" in out.lower()
+    assert "direct dependencies only" in err
+    assert "add --deps" in err
+
+
+@pytest.mark.parametrize(
+    "text, error",
+    [
+        ('print("hello")\n', "no # /// script block"),
+        (SCRIPT_METADATA + "\n" + SCRIPT_METADATA, "more than one # /// script block"),
+        ("# /// script\n# dependencies = [\n# ///\n", "invalid TOML in the # /// script block"),
+        ("# /// script\n# dependencies = 123\n# ///\n", "the # /// script block's dependencies must be a list"),
+    ],
+)
+def test_script_input_errors(capsys, fake_pypi, tmp_path, text, error):
+    script = tmp_path / "example.py"
+    script.write_text(text, encoding="utf-8")
+    code, out, err = run(capsys, str(script), "-p", "3.13", "-t", "win-arm64")
+    assert code == 2
+    assert error in err
+    assert "[project]" not in err and "pyproject.toml" not in err
+    assert fake_pypi == []
+
+
+def test_script_block_text_inside_another_block_isnt_read(capsys, fake_pypi, tmp_path):
+    # The specification's regex matches whole blocks: a `# /// script` line in another block's content is content.
+    script = tmp_path / "example.py"
+    script.write_text(
+        "# /// example\n"
+        "# This is how a script declares its dependencies:\n"
+        "# /// script\n"
+        '# dependencies = ["private-name"]\n'
+        "# ///\n"
+        "# ///\n"
+        "\n" + SCRIPT_METADATA,
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(script), "-p", "3.13", "-t", "win-arm64")
+    assert code == 1
+    assert "nowheels" in out.lower()
+    assert all("private-name" not in url for url in fake_pypi)
+
+
+def test_script_with_a_bom_is_read(capsys, fake_pypi, tmp_path):
+    script = tmp_path / "example.py"
+    script.write_bytes(b"\xef\xbb\xbf" + SCRIPT_METADATA.encode("utf-8"))
+    code, out, err = run(capsys, str(script), "-p", "3.13", "-t", "win-arm64")
+    assert code == 1
+    assert "nowheels" in out.lower()
+
+
+def test_script_that_isnt_utf8_is_an_input_error(capsys, fake_pypi, tmp_path):
+    script = tmp_path / "example.py"
+    script.write_bytes(SCRIPT_METADATA.encode("utf-8") + "# café\n".encode("latin-1"))
+    code, out, err = run(capsys, str(script), "-p", "3.13", "-t", "win-arm64")
+    assert code == 2
+    assert "isn't UTF-8" in err
+    assert "Traceback" not in err
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    "flag", [["--group", "dev"], ["--only-group", "dev"], ["--no-dev"], ["--extra", "test"], ["--all-extras"]]
+)
+def test_script_refuses_extras_and_groups(capsys, fake_pypi, tmp_path, flag):
+    script = tmp_path / "example.py"
+    script.write_text(SCRIPT_METADATA, encoding="utf-8")
+    code, out, err = run(capsys, str(script), *flag, "-p", "3.13", "-t", "win-arm64")
+    assert code == 2
+    assert "don't apply to a script" in err
+    assert "pyproject.toml" not in err
+    assert fake_pypi == []
+
+
+def test_script_input_requires_python_note(capsys, fake_pypi, tmp_path):
+    script = tmp_path / "example.py"
+    script.write_text(SCRIPT_METADATA, encoding="utf-8")
+    code, out, err = run(capsys, str(script), "-p", "3.12", "-p", "3.13", "-t", "win-arm64")
+    assert code == 1
+    assert "requires Python >=3.13, which leaves out Python 3.12" in err
+
+
+def test_script_input_private_index_is_not_pypi_only(tmp_path):
+    from wheelgap.sources import load_file
+
+    script = tmp_path / "example.py"
+    script.write_text(
+        SCRIPT_METADATA.replace("# ///\n", '# [[tool.uv.index]]\n# url = "https://private.example/simple"\n# ///\n'),
+        encoding="utf-8",
+    )
+    assert not load_file(script).pypi_only
+
+
+def test_missing_py_name_is_still_a_package(capsys, fake_pypi, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    code, out, err = run(capsys, "discord.py", "-p", "3.13", "-t", "win-arm64")
+    assert code == 1  # not on the fake index: unknown, not an input error
+    assert "https://pypi.org/pypi/discord-py/json" in fake_pypi
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_script_metadata_ignores_unclosed_and_other_blocks(capsys, fake_pypi, tmp_path, newline):
+    script = tmp_path / "example.py"
+    text = (
+        '# /// other\n# dependencies = ["private-name"]\n# ///\n\n' + SCRIPT_METADATA + "\n# /// script\n# incomplete"
+    )
+    script.write_bytes(text.replace("\n", newline).encode("utf-8"))
+    code, out, err = run(capsys, str(script), "-p", "3.13", "-t", "win-arm64")
+    assert code == 1
+    assert "nowheels" in out.lower()
+    assert all("private-name" not in url for url in fake_pypi)
+
+
+def test_script_deps_refuses_private_index(capsys, fake_pypi, tmp_path):
+    script = tmp_path / "example.py"
+    script.write_text(
+        SCRIPT_METADATA.replace("# ///\n", '# [[tool.uv.index]]\n# url = "https://private.example/simple"\n# ///\n'),
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(script), "--deps", "-p", "3.13", "-t", "win-arm64")
+    assert code == 2
+    assert "the script configures an installer index or source; --deps uses only PyPI" in err
+    assert "lockfile" not in err  # wheelgap can't read example.py.lock
+    assert fake_pypi == []

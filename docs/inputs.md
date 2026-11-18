@@ -1,6 +1,7 @@
 # Inputs
 
-wheelgap takes one or more inputs: lockfiles, requirements files, a `pyproject.toml`, directories, or package names.
+wheelgap takes one or more inputs: lockfiles, requirements files, a `pyproject.toml`, a script with a `# /// script`
+block, directories, or package names.
 With no input it reads the current directory.
 
 ```bash
@@ -19,8 +20,10 @@ wheelgap psycopg2 numpy==2.3.4    # package names, with or without a version
 | [`Pipfile.lock`](#pipfilelock) | no | no |
 | [`pixi.lock`](#pixilock) | no | no |
 | [requirements files](#requirements-files) | no | with `--deps` |
+| [`environment.yml`](#environmentyml) | no | with `--deps` |
 | [pip installation report](#pip-installation-report) | no | no |
 | [`pyproject.toml`](#pyprojecttoml) | no | with `--deps` |
+| [Python scripts](#python-scripts) | no | with `--deps` |
 | [package names](#package-names) | no | with `--deps` |
 
 "Read without network" means the lockfile records every file published for each pinned version, so wheelgap
@@ -48,10 +51,13 @@ A **file** is read by its name:
 | `Pipfile.lock` | `Pipfile.lock` |
 | `pixi.lock` | `pixi.lock` |
 | `requirements*.lock`, `*.txt`, `*.in` | a requirements file |
+| `*.json` | a pip installation report |
+| `environment*.yml`, `environment*.yaml` | a conda environment file (pip packages) |
 | `pyproject.toml` | a project's direct dependencies |
+| `*.py` | a script's `# /// script` block (PEP 723) |
 
 Any other name is an error. An argument that isn't an existing file or directory is read as a
-[package name](#package-names), unless it contains `/` or ends in `.lock`, `.txt` or `.toml`, which is an error
+[package name](#package-names), unless it contains `/` or ends in `.lock`, `.txt`, `.toml`, `.json`, `.in`, `.yml` or `.yaml`, which is an error
 (`no such file`).
 
 Packages that can't come from an index, such as Git, path or URL dependencies, are **skipped**: they're listed on a
@@ -279,6 +285,33 @@ holds, as pip evaluates it: `urllib3<2; python_version < "3.12"` constrains Pyth
 target can't decide a marker on an installed package (`platform_release`, `platform_version`, or `platform_machine`
 on a target such as `linux-armv7l`), wheelgap refuses rather than guess, as it does for a URL or path constraint.
 
+## environment.yml
+
+Pass a conda `environment.yml` or `environment.yaml` (or another `environment*.yml` / `environment*.yaml` name, such
+as `environment-dev.yml`) by explicit path (directory search doesn't pick it up) to check the PyPI packages listed
+under `dependencies:` → `pip:`:
+
+```bash
+wheelgap environment.yml -p 3.12 -t linux-aarch64,win-arm64
+```
+
+**Read:** each item in a `pip:` list is read as a [requirements file](#requirements-files) line, so pins, ranges,
+markers, `-r` / `-c` includes, `--no-binary` / `--only-binary` and `--deps` work the same way. An `--index-url` or
+`--extra-index-url` entry in `pip:` marks the file as not PyPI-only, just as in a requirements file.
+
+**Skipped:** conda dependencies (such as `python=3.12`, `numpy`, `pip`) are listed as skipped (`conda`), and editable,
+path and URL lines under `pip:` are skipped as in a requirements file. When the `pip:` list is empty (or absent),
+wheelgap reports `No packages to check.` and exits `0`.
+
+**`--deps` and conda packages:** with `--deps`, every dependency of the `pip:` packages is looked up on PyPI, including
+ones conda installs (such as `numpy`). pip skips a requirement that conda already satisfied in the environment, so
+wheelgap can report a gap that pip would never hit there, or check a different version than conda installed.
+
+The file is read with wheelgap's strict block-YAML reader. `#` comments (whole-line, or after a space at the end of a
+line) and a one-line `channels: [conda-forge, defaults]` are read; `dependencies` and `pip:` must be block lists
+(`- name` lines). YAML constructs it doesn't understand (anchors, aliases, other flow collections, block scalars,
+tabs) are input errors (exit 2) rather than guesses.
+
 ## pyproject.toml
 
 Libraries usually don't commit a lockfile. Pass the library's `pyproject.toml` to check the dependencies it declares
@@ -289,6 +322,9 @@ wheelgap pyproject.toml -t win-arm64 -t pyodide
 # Add [project.optional-dependencies] groups
 wheelgap pyproject.toml --extra test
 wheelgap pyproject.toml --all-extras
+# Add PEP 735 dependency groups, or check only those groups
+wheelgap pyproject.toml --group test
+wheelgap pyproject.toml --only-group docs
 # Resolve what the declared requirements and the selected extra install
 wheelgap pyproject.toml --extra test --deps -t win-arm64 --explain
 ```
@@ -297,17 +333,61 @@ Each requirement is read like a line of a requirements file, so ranges and bare 
 and markers are respected. A range picks the newest release whose `Requires-Python` allows each `-p` version, so with
 several it can pick a different release per Python ([how it works](how-it-works.md)). A bare name always checks the
 latest release, even for a `-p` version that can't install it, so it can show false gaps. Only direct
-dependencies are checked by default and wheelgap prints a note saying so. Add [`--deps`](cli.md#deps) to resolve
-them and the selected extras using PyPI's metadata for each target. Projects that configure a custom installer
-index or source need a lockfile for this check.
+dependencies are checked by default and wheelgap prints a note saying so. Add [`--deps`](cli.md#deps) to resolve them
+and the selected extras and dependency groups using PyPI's metadata for each target. Projects that configure a custom
+installer index or source need a lockfile for this check.
 
 If `[project] requires-python` leaves out a `-p` Python (every clause counts, as pip applies them), that target is
 still checked and a note names it; an invalid `requires-python` is ignored with a note.
 
-`[dependency-groups]` isn't read yet, so `--group`, `--only-group` and `--no-dev` are errors here. A `dependencies`
-listed in `[project] dynamic` is an input error (exit 2), as are dynamic `optional-dependencies` with
-`--extra`/`--all-extras` and Poetry dependencies kept in `[tool.poetry.dependencies]` (check `poetry.lock` instead).
+`[dependency-groups]` (PEP 735) is read with no group selected by default, as with `pip install --group`. `--group NAME`
+adds a group to the project's dependencies; `--only-group NAME` checks only the named groups (combine it with `--group`
+to add more, but not with `--extra` or `--all-extras`). Group names are normalized, `{include-group = "name"}` entries
+include another group, and duplicate requirements count once. A requirement on the project itself in a group installs
+the project: `mylib` adds the project's dependencies, and `mylib[test]` adds them and the `test` extra, with
+`--only-group` too. Unknown groups, include cycles, malformed entries and names that collide once normalized are input
+errors (exit 2); a group that isn't selected isn't read further than its name. `--no-dev` stays an error because no
+group is included by default. A `dependencies` listed in `[project] dynamic` is an input error (exit 2), as are dynamic
+`optional-dependencies` with `--extra`/`--all-extras` and Poetry dependencies kept in `[tool.poetry.dependencies]`
+(check `poetry.lock` instead).
 `check_lockfile()` and `wheelgap diff` don't read `pyproject.toml` as an input.
+
+## Python scripts
+
+A single-file script can declare what it needs in a `# /// script` block
+([PEP 723 inline script metadata](https://packaging.python.org/en/latest/specifications/inline-script-metadata/)),
+which `uv run` and `pipx run` install before running it. Pass the `.py` file to check those dependencies:
+
+```python
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["httpx", "rich"]
+# ///
+```
+
+```bash
+wheelgap example.py -t win-arm64
+# Resolve what the dependencies install
+wheelgap example.py --deps -t win-arm64 --explain
+```
+
+The script is never run or imported: wheelgap finds the blocks with the specification's regular expression and reads
+the `script` one as TOML. A file with no `script` block, two `script` blocks, invalid TOML or a file that isn't UTF-8
+is an input error (exit 2); a `# /// script` line inside another block's content isn't a block of its own.
+
+`dependencies` is read like `[project] dependencies` in a [`pyproject.toml`](#pyprojecttoml): only the direct
+requirements are checked, with a note saying so, unless you add [`--deps`](cli.md#deps) to resolve what they install
+for each target. If `requires-python` leaves out a `-p` Python, that target is still checked and a note names it.
+A script has no extras or dependency groups, so `--extra`, `--all-extras`, `--group`, `--only-group` and `--no-dev` are
+errors here.
+
+If the block's `[tool.uv]` sets an index or sources (or a `uv.toml` or `pyproject.toml` beside the script or above it
+does), its packages may not be PyPI's: `--deps` refuses the script, and their names aren't sent to the services other
+flags use ([which names leave the run](how-it-works.md#pypi-origin)). [`--fix`](cli.md#fix) gives the `[tool.uv]`
+lines to add to the block for `uv run`. wheelgap doesn't read a script's lock (`example.py.lock`, from
+`uv lock --script`) yet. Without `--deps`, `check_lockfile()` and `wheelgap diff` don't read a script.
+
+A `.py` argument that isn't an existing file, such as `discord.py`, is still a [package name](#package-names).
 
 ## Package names
 

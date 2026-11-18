@@ -2,12 +2,13 @@
 conftest.py (the autouse gap_wheels fixture): never the network."""
 
 import json
+import tomllib
 import urllib.error
 
 import pytest
 from test_cli import _assert_matches_output_schema, run
 
-from wheelgap import gapwheels, pypi
+from wheelgap import cli, gapwheels, pypi
 from wheelgap.check import Row, Status
 from wheelgap.sources import Package, Source
 from wheelgap.targets import build_targets
@@ -68,6 +69,18 @@ def test_pip_way_for_a_requirements_file(capsys, fake_pypi, gap_wheels, tmp_path
     (tmp_path / "requirements.txt").write_text("nowheels==0.9\n", encoding="utf-8")
     code, out, _ = run(capsys, str(tmp_path / "requirements.txt"), "-p", "3.14t", "-t", "win-arm64", "--fix")
     assert code == 1 and "  nowheels 0.9: win-arm64\n" in out and f"  --extra-index-url {INDEX}\n" in out
+
+
+def test_pip_way_for_a_conda_environment_file(capsys, fake_pypi, gap_wheels, tmp_path):
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    env = tmp_path / "environment.yml"
+    env.write_text("dependencies:\n  - python=3.14\n  - pip:\n    - nowheels==0.9\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(env), "-p", "3.14t", "-t", "win-arm64", "--fix")
+    assert code == 1 and "  nowheels 0.9: win-arm64\n" in out
+    assert f"To install them with pip, add this line to your requirements file:\n  --extra-index-url {INDEX}\n" in out
+    assert "lock again" not in out and "[tool.uv" not in out
+    code, out, _ = run(capsys, str(env), "-p", "3.14t", "-t", "win-arm64", "--fix", "--explain")
+    assert f"pip install --extra-index-url {INDEX} nowheels==0.9" in out
 
 
 def test_uv_way_for_a_uv_lock_with_direct_and_transitive_packages(capsys, fixtures, gap_wheels):
@@ -374,6 +387,55 @@ def test_no_binary_package_isnt_blamed_on_its_origin(capsys, fake_pypi, gap_whee
     assert data["gap_wheels"] == [] and "can't tell they come from PyPI" not in err
 
 
+def test_uv_way_for_a_script_goes_in_its_script_block(capsys, fake_pypi, gap_wheels, tmp_path):
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    script = tmp_path / "example.py"
+    script.write_text('# /// script\n# dependencies = ["nowheels==0.9"]\n# ///\nprint("hi")\n', encoding="utf-8")
+    args = [str(script), "-p", "3.14t", "-t", "win-arm64"]
+    code_plain, out_plain, _ = run(capsys, *args)
+    code, out, _ = run(capsys, *args, "--fix")
+    assert code == code_plain == 1
+    assert out.removeprefix(out_plain) == (
+        "\n"
+        "wheelgap's gap wheel index has wheels PyPI lacks for:\n"
+        "  nowheels 0.9: win-arm64\n"
+        "\n"
+        "To install them with uv run, add this at the end of example.py's # /// script block:\n"
+        "\n"
+        "# [[tool.uv.index]]\n"
+        '# name = "wheelgap"\n'
+        f'# url = "{INDEX}"\n'
+        "# explicit = true\n"
+        "#\n"
+        "# [tool.uv.sources]\n"
+        '# nowheels = { index = "wheelgap" }\n'
+        "\n"
+        f"{gapwheels.SCRIPT_MERGE}\n"
+        "\n"
+        "How these wheels are built and checked: https://wheelgap.github.io/wheels/\n"
+    )
+    # No lockfile advice (wheelgap doesn't read example.py.lock) and no pip line: uv run reads the block.
+    assert "pins each file" not in out and "lock again" not in out and "--extra-index-url" not in out
+
+
+def test_script_fix_says_to_list_a_transitive_package_and_renders_in_markdown():
+    fill = _fill("script", "example.py", ["parent", "x"])
+    fill.source.specs.append("parent>=1")
+    text = gapwheels.text_lines([fill], False)
+    assert "To install them with uv run, add this at the end of example.py's # /// script block:" in text
+    assert '# x = { index = "wheelgap" }' in text
+    assert (
+        'uv only applies [tool.uv.sources] to a script\'s own dependencies, so also list "x" in its dependencies.'
+    ) in text
+    assert not any("pins each file" in line for line in text)
+    md = "\n".join(gapwheels.markdown_lines([fill], False))
+    assert "add this at the end of `example.py`'s `# /// script` block:\n\n```python\n# [[tool.uv.index]]\n" in md
+    assert '- uv only applies `[tool.uv.sources]` to a script\'s own dependencies, so also list `"x"`' in md
+    assert "pins each file" not in md
+    fill.source.specs.append("x==1")  # listed in the block: no note
+    assert not any("also list" in line for line in gapwheels.text_lines([fill], False))
+
+
 def test_lock_advice_carries_the_private_index_caveat():
     assert gapwheels.LOCK_CAVEAT in gapwheels.text_lines([_fill("poetry", "poetry.lock")], False)
 
@@ -486,3 +548,130 @@ def test_no_cache_does_not_save_the_gap_wheel_list(capsys, fake_pypi, gap_wheels
     assert gap_wheels.calls == 2  # the --no-cache run saved nothing for this one to read
     run(capsys, *NOWHEELS, "--fix")
     assert gap_wheels.calls == 2  # but this one saved it
+
+
+SNIPPET = ["-p", "3.14t", "-t", "win-arm64", "--fix", "--print-gap-wheel-snippet"]
+ABOUT = f"# Gap wheels are {gapwheels.UNOFFICIAL}: https://wheelgap.github.io/wheels/\n"
+
+
+def test_print_gap_wheel_snippet_for_a_requirements_file(capsys, fake_pypi, gap_wheels, tmp_path):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("nowheels==0.9\n", encoding="utf-8")
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    code, out, _ = run(capsys, str(requirements), *SNIPPET)
+    assert code == 1  # the check's own exit code
+    assert out == (
+        "# requirements.txt (pip): add this line to it, or pass it to pip install.\n"
+        f"{ABOUT}"
+        "# fills: nowheels 0.9: win-arm64\n"
+        f"# {gapwheels.PIP_CAVEAT}\n"
+        f"--extra-index-url {INDEX}\n"
+        f"# If the requirements pin hashes, add --hash=sha256:{'ab' * 32} to the nowheels==0.9 line.\n"
+    )
+    assert requirements.read_text(encoding="utf-8") == "nowheels==0.9\n"
+    assert list(tmp_path.iterdir()) == [requirements]
+
+
+def test_print_gap_wheel_snippet_for_package_names(capsys, fake_pypi, gap_wheels):
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    code, out, _ = run(capsys, "nowheels==0.9", *SNIPPET)
+    assert code == 1
+    assert out.startswith(
+        "# command line (pip): add this line to a requirements file, or pass it to pip install.\n"
+        f"{ABOUT}"
+        "# fills: nowheels 0.9: win-arm64\n"
+    )
+    assert f"\n--extra-index-url {INDEX}\n" in out
+
+
+def test_print_gap_wheel_snippet_for_a_uv_lock(capsys, fixtures, gap_wheels):
+    gap_wheels.add("puresdist", "1.0", "puresdist-1.0-cp314-cp314t-win_arm64.whl")
+    gap_wheels.add("nativeext", "0.3", "nativeext-0.3-cp314-cp314t-win_arm64.whl")
+    root = fixtures / "uvproj"
+    original_lock = (root / "uv.lock").read_bytes()
+    assert not (root / "pyproject.toml").exists()
+    code, out, _ = run(capsys, str(root / "uv.lock"), *SNIPPET)
+    assert code == 1
+    assert out == (
+        f"# {root / 'pyproject.toml'} (uv): add this, then run uv lock.\n"
+        f"{ABOUT}"
+        "# fills: nativeext 0.3: win-arm64\n"
+        "# fills: puresdist 1.0: win-arm64\n"
+        "[[tool.uv.index]]\n"
+        'name = "wheelgap"\n'
+        f'url = "{INDEX}"\n'
+        "explicit = true\n"
+        "\n"
+        "[tool.uv.sources]\n"
+        'nativeext = { index = "wheelgap" }\n'
+        'puresdist = { index = "wheelgap" }\n'
+        "# nativeext comes in through fastlib; uv only applies [tool.uv.sources] to direct dependencies, so also list "
+        '"nativeext" where fastlib is (the same dependencies, dependency group or extra).\n'
+        f"# {gapwheels.UV_MERGE}\n"
+    )
+    assert tomllib.loads(out)["tool"]["uv"]["sources"]["puresdist"] == {"index": "wheelgap"}
+    assert (root / "uv.lock").read_bytes() == original_lock
+    assert not (root / "pyproject.toml").exists()
+
+
+def test_print_gap_wheel_snippet_is_empty_when_no_wheel_fits(capsys, fake_pypi, gap_wheels):
+    gap_wheels.add("nowheels", "0.8", "nowheels-0.8-cp314-cp314t-win_arm64.whl")
+    code, out, _ = run(capsys, "nowheels==0.9", *SNIPPET)
+    assert code == 1 and out == ""
+
+
+@pytest.mark.parametrize(
+    ("inputs", "named"),
+    [
+        (lambda fixtures, tmp: [str(fixtures / "poetryproj" / "poetry.lock")], "poetry.lock"),
+        (lambda fixtures, tmp: [str(tmp / "pyproject.toml")], "pyproject.toml"),
+        (lambda fixtures, tmp: [str(tmp / "environment.yml")], "environment.yml"),
+        (
+            lambda fixtures, tmp: [str(tmp / "requirements.txt"), str(fixtures / "uvproj" / "uv.lock")],
+            "requirements.txt, uv.lock",
+        ),
+    ],
+)
+def test_print_gap_wheel_snippet_refuses_other_inputs_before_any_lookup(
+    capsys, fake_pypi, gap_wheels, fixtures, tmp_path, inputs, named
+):
+    gap_wheels.add("nowheels", "0.9", FT_WHEEL)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "app"\nversion = "0"\ndependencies = ["nowheels==0.9"]\n', encoding="utf-8"
+    )
+    (tmp_path / "requirements.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    (tmp_path / "environment.yml").write_text("dependencies:\n  - pip:\n    - nowheels==0.9\n", encoding="utf-8")
+    code, out, err = run(capsys, *inputs(fixtures, tmp_path), *SNIPPET)
+    assert code == 2 and out == ""
+    assert err == (
+        f"wheelgap: error: --print-gap-wheel-snippet has no snippet for {named}: it takes one uv.lock, one "
+        "requirements file or package names on the command line (--fix alone covers the others)\n"
+    )
+    assert gap_wheels.calls == 0 and fake_pypi == []  # decided from the inputs alone, so the same every run
+
+
+@pytest.mark.parametrize(
+    ("argv", "flag"),
+    [
+        (["nowheels==0.9", "--print-gap-wheel-snippet"], "needs --fix"),
+        ([*NOWHEELS, "--fix", "--print-gap-wheel-snippet", "--json"], "--json"),
+        ([*NOWHEELS, "--fix", "--print-gap-wheel-snippet", "--explain", "--conda-forge"], "--explain"),
+        ([*NOWHEELS, "--fix", "--print-gap-wheel-snippet", "--all"], "--all"),
+        ([*NOWHEELS, "--fix", "--print-gap-wheel-snippet", "--markdown"], "--markdown"),
+        ([*NOWHEELS, "--fix", "--print-gap-wheel-snippet", "--junit", "out.xml"], "--junit"),
+        ([*NOWHEELS, "--fix", "--print-gap-wheel-snippet", "--sarif", "out.sarif"], "--sarif"),
+        ([*NOWHEELS, "--fix", "--print-gap-wheel-snippet", "--badge", "badge.json"], "--badge"),
+        ([*NOWHEELS, "--fix", "--print-gap-wheel-snippet", "--github-annotations"], "--github-annotations"),
+        ([*NOWHEELS, "--fix", "--print-gap-wheel-snippet", "--write-constraints", "c.txt"], "--write-constraints"),
+        (["--from-log", "LOG", *SNIPPET], "--from-log"),
+        (["--dist", "dist", *SNIPPET], "--dist"),
+    ],
+)
+def test_print_gap_wheel_snippet_refused_combinations(capsys, gap_wheels, fixtures, argv, flag):
+    argv = [str(fixtures / "pip25-two-failed.log") if a == "LOG" else a for a in argv]
+    with pytest.raises(SystemExit) as error:
+        cli.main(argv)
+    assert error.value.code == 2
+    err = capsys.readouterr().err
+    assert "--print-gap-wheel-snippet" in err and flag in err
+    assert gap_wheels.calls == 0

@@ -19,7 +19,7 @@ from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 
-from . import __version__, cache, condaforge, gapwheels, origin
+from . import __version__, cache, condaforge, gapwheels, origin, piwheels
 from . import notes as tracker
 from . import suggest as release_suggest
 from .api import explain_issues_urls, running_python
@@ -28,6 +28,7 @@ from .build import BuildInfo, describe, lookup_all, requires_for, shown
 from .check import (
     CELL,
     EXPLAIN_LIMIT,
+    HINTED,
     Row,
     Status,
     check,
@@ -37,6 +38,7 @@ from .check import (
     marker_holds,
     reachable,
 )
+from .codequality import write_codequality
 from .constraints import write_constraints
 from .deps import Resolver, pinned_complete, resolve_deps
 from .dockerfile import DockerfileError, read_dockerfile
@@ -65,6 +67,7 @@ from .sources import (
     parse_dist,
     pythons_outside_lock,
     select_pyproject_extras,
+    select_pyproject_groups,
     select_uv_dependencies,
     skipped_list,
     uv_selected_roots,
@@ -150,7 +153,8 @@ def make_parser() -> argparse.ArgumentParser:
         metavar="INPUT",
         help=(
             "uv.lock, pylock.toml, poetry.lock, Pipfile.lock, pixi.lock, requirements.txt, report.json, "
-            "pyproject.toml (direct dependencies), a directory, or package specs (default: .)"
+            "environment.yml (pip packages), pyproject.toml (direct dependencies), a script.py's # /// script block "
+            "(PEP 723), a directory, or package specs (default: .)"
         ),
     )
     p.add_argument(
@@ -218,7 +222,10 @@ def make_parser() -> argparse.ArgumentParser:
         "--group",
         action="append",
         metavar="NAME",
-        help="include a dependency group (uv.lock, Poetry 2.x poetry.lock, pdm.lock; repeatable)",
+        help=(
+            "include a dependency group (uv.lock, Poetry 2.x poetry.lock, pdm.lock, or pyproject.toml "
+            "[dependency-groups]; repeatable)"
+        ),
     )
     p.add_argument(
         "--no-dev", action="store_true", help="exclude the dev group (uv.lock, Poetry 2.x poetry.lock, pdm.lock)"
@@ -248,8 +255,8 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--from-log",
         metavar="FILE",
-        help="read the packages a failed pip or uv install couldn't build from its log FILE (- for stdin) and check "
-        "them with --explain --suggest; needs -p and -t (or --dockerfile) for where the install ran",
+        help="read the packages a failed pip, uv, Poetry or PDM install couldn't build from its log FILE (- for stdin) "
+        "and check them with --explain --suggest; needs -p and -t (or --dockerfile) for where the install ran",
     )
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
     p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
@@ -267,10 +274,17 @@ def make_parser() -> argparse.ArgumentParser:
         "platform (sends the names of PyPI packages with gaps to anaconda.org)",
     )
     p.add_argument(
+        "--piwheels",
+        action="store_true",
+        help="with --explain, also say when piwheels has a wheel of the same version for a linux-armv7l (Raspberry "
+        "Pi) gap (sends the names of PyPI packages with gaps to piwheels.org)",
+    )
+    p.add_argument(
         "--deps",
         action="store_true",
-        help="for package names, requirements files or pyproject.toml, also check what they install, resolved "
-        "per target from PyPI's metadata (looks each dependency up on pypi.org; a lockfile is exact)",
+        help="for package names, requirements files, pyproject.toml or a script's # /// script block, also check "
+        "what they install, resolved per target from PyPI's metadata (looks each dependency up on pypi.org; a "
+        "lockfile is exact)",
     )
     p.add_argument(
         "--suggest",
@@ -301,6 +315,12 @@ def make_parser() -> argparse.ArgumentParser:
         "not with --offline, and off with --index-url or a WHEELGAP_INDEX_URL mirror)",
     )
     p.add_argument(
+        "--print-gap-wheel-snippet",
+        action="store_true",
+        help="with --fix, print only the configuration that installs the gap wheels, for one uv.lock, requirements "
+        "file or package names (other inputs are refused); it never writes to your project",
+    )
+    p.add_argument(
         "-q",
         "--quiet",
         action=argparse.BooleanOptionalAction,
@@ -317,6 +337,11 @@ def make_parser() -> argparse.ArgumentParser:
         "--junit",
         metavar="PATH",
         help="also write a JUnit XML report to PATH, alongside the usual output",
+    )
+    p.add_argument(
+        "--gitlab-code-quality",
+        metavar="PATH",
+        help="also write a GitLab Code Quality JSON report to PATH for merge request findings",
     )
     p.add_argument(
         "--sarif",
@@ -376,7 +401,7 @@ def make_parser() -> argparse.ArgumentParser:
         nargs="?",
         const=".",
         metavar="DIR",
-        help="suggest targets and Pythons from DIR's GitHub Actions workflows and Dockerfiles (default: .), "
+        help="suggest targets and Pythons from DIR's GitHub Actions, GitLab CI and Dockerfiles (default: .), "
         "with a [tool.wheelgap] snippet; checks nothing",
     )
     p.add_argument("-V", "--version", action="version", version=version_string())
@@ -703,6 +728,12 @@ def gap_targets(row: Row, targets: list[Target]) -> list[Target]:
     return [t for t in targets if row.results[t] in (Status.SOURCE, Status.MISSING) and t not in row.ignored]
 
 
+def traced_targets(row: Row, targets: list[Target]) -> list[Target]:
+    """The gap targets plus those where the package couldn't be looked up (unknown): what --json --explain's `via`
+    and `direct` trace to the user's own requirements (#453)."""
+    return [t for t in targets if row.results[t] in HINTED and t not in row.ignored]
+
+
 RowNotes = dict[int, list[tuple[tracker.Note, list[Target]]]]
 """The tracker's notes that apply to a row's gaps, keyed by id(row), each with the gap targets it covers."""
 RowBuilds = dict[int, list[tuple[Target, tracker.Build]]]
@@ -775,11 +806,12 @@ def render_explain(
     builds: RowBuilds | None = None,
     issues_urls: dict[int, str | None] | None = None,
     published_wheels: list[gapwheels.Fill] | None = None,
+    pi_wheels: dict[int, piwheels.Hint] | None = None,
 ) -> list[str]:
-    """`conda_forge`: --conda-forge hints, `build_info`: --build-info answers and `suggestions`: --suggest's, by id()
-    of the row's package. `notes` and `builds` (the tracker's build lab results): --notes, by id() of the row.
-    `published_wheels`: --fix's fills (from the gap wheel list, which may come from the 24-hour cache), shown once per
-    release under its first filled target."""
+    """`conda_forge`: --conda-forge hints, `piwheels`: --piwheels hints, `build_info`: --build-info answers and
+    `suggestions`: --suggest's, by id() of the row's package. `notes` and `builds` (the tracker's build lab results):
+    --notes, by id() of the row. `published_wheels`: --fix's fills (from the gap wheel list, which may come from the
+    24-hour cache), shown once per release under its first filled target."""
     multi_py = len({t.python for t in targets}) > 1
     filled: dict[int, list[gapwheels.Fill]] = {}
     for fill in published_wheels or []:
@@ -825,6 +857,8 @@ def render_explain(
             out.append("")
         if conda_forge and (h := conda_forge.get(id(r.package))):
             out += [condaforge.hint_text(r.package, h, multi_py), ""]
+        if pi_wheels and (pw := pi_wheels.get(id(r.package))):
+            out += [piwheels.hint_text(r.package, pw, multi_py), ""]
         for note, ts in (notes or {}).get(id(r), []):
             # Printed as is: a note is one line of plain text (tracker.parse). It can't hold a GitHub Actions workflow
             # command either: tracker.parse drops a note with "##[" or a word starting with "::", and the text never
@@ -938,6 +972,7 @@ def report_json(
     dropped: dict[str, str] | None = None,
     issues_urls: dict[int, str | None] | None = None,
     gap_wheels: list[gapwheels.Fill] | None = None,
+    pi_wheels: dict[int, piwheels.Hint] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -968,13 +1003,15 @@ def report_json(
                 ]
                 for t in gap_targets(r, targets)
             }
-            # Same targets as `rejected`, minus any without a path (inputs with no dependency graph).
-            out["via"] = {t.label(multi_py): r.via[t] for t in gap_targets(r, targets) if t in r.via}
-            # The direct dependencies that lead to each gap target, as the table's `(via ...)` names them; only where
-            # the input says (uv.lock, Poetry 1.x, --deps), so `{}` for a direct dependency or an input without a graph.
+            # The gap targets and those where the lookup failed (unknown), minus any without a path (inputs with no
+            # dependency graph).
+            out["via"] = {t.label(multi_py): r.via[t] for t in traced_targets(r, targets) if t in r.via}
+            # The direct dependencies that lead to each of those targets, as the table's `(via ...)` names them; only
+            # where the input says (uv.lock, Poetry 1.x, --deps), so `{}` for a direct dependency or an input without
+            # a graph.
             out["direct"] = {
                 t.label(multi_py): list(dict.fromkeys(r.direct_via[t]))
-                for t in gap_targets(r, targets)
+                for t in traced_targets(r, targets)
                 if r.direct_via.get(t)
             }
             if gap_wheels is not None:
@@ -988,6 +1025,13 @@ def report_json(
                     "name": h.name,
                     "version": h.version,
                     "builds": {t.label(multi_py): subdirs for t, subdirs in h.builds.items()},
+                }
+            if pi_wheels and (pw := pi_wheels.get(id(r.package))):
+                out["piwheels"] = {
+                    "name": pw.name,
+                    "version": pw.version,
+                    "wheels": {t.label(multi_py): ws for t, ws in pw.wheels.items()},
+                    "apt": pw.apt,
                 }
             # The tracker's notes for this package's gaps, each with the gap targets it covers.
             out["notes"] = [
@@ -1227,6 +1271,7 @@ def render_markdown(
     suggestions: Suggestions | None = None,
     dropped: dict[str, str] | None = None,
     issues_urls: dict[int, str | None] | None = None,
+    pi_wheels: dict[int, piwheels.Hint] | None = None,
 ) -> list[str]:
     """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
     plain = Style(False)
@@ -1304,6 +1349,7 @@ def render_markdown(
             build_info,
             builds=builds,
             issues_urls=issues_urls,  # inside the fence below, so shown exactly, with no escaping
+            pi_wheels=pi_wheels,
         )
         fence = "`" * max([3, *(len(run) + 1 for line in lines for run in re.findall(r"`+", line))])
         out += ["<details><summary>Why (rejected wheels)</summary>", "", fence, *lines, fence, "", "</details>", ""]
@@ -1471,6 +1517,52 @@ def conda_forge_hints(
     return hints
 
 
+def piwheels_hints(
+    gaps: list[Row], targets: list[Target], sources: list[Source], index_url: str | None, quiet: bool, cached: dict
+) -> dict[int, piwheels.Hint]:
+    """--piwheels: look the gap packages up on piwheels.org and return their hints, by id() of the package. Only
+    names that are positively PyPI's are sent, and none that another input of the run places elsewhere
+    (origin.private_names); notes on stderr say which packages weren't looked up, and why."""
+    other = origin.other_index(index_url)
+    elsewhere = origin.private_names(sources, simple_index=index_url)
+    if other is not None and not quiet:
+        print(
+            "wheelgap: note: --piwheels looks nothing up when packages come from another index "
+            f"({other}), so no package names leave it",
+            file=sys.stderr,
+        )
+    source_of = {id(p): s for s in sources for original in s.packages for p in original.variants}
+    asked: list[Row] = []
+    kept_in: dict[str, str] = {}  # by canonical name, so two spellings of one package count once
+    for r in gaps:
+        if r.package.version and piwheels.wanted(gap_targets(r, targets)):
+            if origin.known_pypi(r.package, source_of[id(r.package)], simple_index=index_url, private=elsewhere):
+                asked.append(r)
+            else:
+                kept_in.setdefault(r.package.key, r.package.name)
+    if kept_in and other is None and not quiet:
+        private = list(kept_in.values())
+        print(
+            f"wheelgap: note: --piwheels didn't look up {len(private)} package{'s' * (len(private) != 1)} "
+            f"whose index isn't known to be PyPI ({_names(private)}), so their names stay private",
+            file=sys.stderr,
+        )
+    lookups = piwheels.look_up_all([(r.package.key, r.package.version or "") for r in asked], **cached)
+    if lookups.unchecked and not quiet:
+        n = len(lookups.unchecked)
+        which = _names([f"{name} ({why})" for name, why in lookups.unchecked.items()])
+        print(
+            f"wheelgap: note: --piwheels couldn't check {n} package{'s' * (n != 1)}: {which}; "
+            "no hint doesn't mean piwheels has no wheel",
+            file=sys.stderr,
+        )
+    hints = {}
+    for r in asked:
+        if h := piwheels.hint(r.package, gap_targets(r, targets), lookups.found):
+            hints[id(r.package)] = h
+    return hints
+
+
 def version_suggestions(
     gaps: list[Row], targets: list[Target], sources: list[Source], index_url: str | None, quiet: bool
 ) -> Suggestions:
@@ -1625,6 +1717,32 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     args = parser.parse_args(argv)
     if args.json and args.markdown:
         parser.error("--json and --markdown can't be used together")
+    if args.print_gap_wheel_snippet:
+        if not args.fix:
+            parser.error("--print-gap-wheel-snippet needs --fix")
+        given = [
+            flag
+            for flag, value in (
+                ("--json", args.json),
+                ("--markdown", args.markdown),
+                ("--explain", args.explain),
+                ("--all", args.all),
+                ("--from-log", args.from_log is not None),
+                ("--dist", bool(args.dist)),
+                ("--junit", args.junit is not None),
+                ("--sarif", args.sarif is not None),
+                ("--gitlab-code-quality", args.gitlab_code_quality is not None),
+                ("--badge", args.badge is not None),
+                ("--write-constraints", args.write_constraints is not None),
+                ("--github-annotations", args.github_annotations),
+            )
+            if value
+        ]
+        if given:
+            parser.error(
+                "--print-gap-wheel-snippet prints only the configuration for one uv.lock, requirements file or "
+                f"package names, so it can't be used with {', '.join(given)}"
+            )
     if args.list_targets and args.markdown:
         parser.error("--list-targets has no Markdown form (use --json)")
     if args.offline and args.online:
@@ -1684,6 +1802,8 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         return 0
     if args.conda_forge and not args.explain:
         parser.error("--conda-forge only adds to --explain; pass --explain too")
+    if args.piwheels and not args.explain:
+        parser.error("--piwheels only adds to --explain; pass --explain too")
     build_args: dict[str, str] = {}
     for item in args.build_arg or []:
         name, eq, value = item.partition("=")
@@ -1828,6 +1948,12 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             sources = (
                 [parse_dist(Path(args.dist))] if args.dist else load_inputs(args.inputs or ["."], args.environment)
             )
+        if args.print_gap_wheel_snippet and (len(sources) != 1 or sources[0].kind not in gapwheels.SNIPPET_KINDS):
+            # Decided from the inputs, before any lookup, so the exit code doesn't depend on what the index has.
+            raise SourceError(
+                f"--print-gap-wheel-snippet has no snippet for {', '.join(s.label for s in sources)}: it takes one "
+                "uv.lock, one requirements file or package names on the command line (--fix alone covers the others)"
+            )
         for source in sources:
             check_report_targets(source, targets)
             if source.passed_over is not None and not quiet:
@@ -1847,16 +1973,27 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             group_names = [name for name in group_names if canonicalize_name(name) != "dev"]
         from_cli = args.extra is not None or args.group is not None or args.all_extras or args.no_dev
         # pyproject.toml inputs take --extra / --all-extras for [project] optional-dependencies. Configured
-        # extras don't apply to them, and [dependency-groups] isn't read.
+        # extras and groups don't apply to them; groups are selected explicitly as with pip --group.
         pyproject_sources = [s for s in sources if s.pyproject_extras is not None]
         lock_sources = [s for s in sources if s.pyproject_extras is None]
         if pyproject_sources:
-            if args.group is not None or args.only_group or args.no_dev:
+            if any(s.kind == "script" for s in pyproject_sources) and (
+                args.group is not None or args.only_group or args.no_dev or args.extra or args.all_extras
+            ):
                 raise SourceError(
-                    "--group, --only-group and --no-dev don't apply to pyproject.toml: "
-                    "[dependency-groups] isn't read, only [project] dependencies and --extra groups"
+                    "--extra, --all-extras, --group, --only-group and --no-dev don't apply to a script: "
+                    "its # /// script block has no extras or dependency groups"
+                )
+            if args.no_dev:
+                raise SourceError(
+                    "--no-dev doesn't apply to pyproject.toml: no dependency group is selected by default"
+                )
+            if args.only_group and (args.extra or args.all_extras):
+                raise SourceError(
+                    "--only-group cannot be combined with --extra or --all-extras for pyproject.toml inputs"
                 )
             for source in pyproject_sources:
+                select_pyproject_groups(source, args.group or [], args.only_group or [])
                 select_pyproject_extras(source, args.extra or [], args.all_extras)
         if (from_cli or args.only_group or extra_names is not None or group_names is not None) and (
             lock_sources or not pyproject_sources
@@ -1881,8 +2018,8 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             dependency_sources = [s for s in sources if s.specs or s.pyproject_extras is not None]
             if not dependency_sources:
                 raise SourceError(
-                    "--deps applies to package names on the command line, requirements files or pyproject.toml; "
-                    "a lockfile already lists what it installs"
+                    "--deps applies to package names on the command line, requirements files, pyproject.toml or a "
+                    "script's # /// script block; a lockfile already lists what it installs"
                 )
             if offline:
                 raise SourceError(
@@ -1898,15 +2035,18 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 # can't see, so it refuses rather than answer for the wrong index.
                 if not (source.requirements or source.pyproject_extras is not None):
                     continue
+                # wheelgap can't read a script's lock (example.py.lock), so a script gets no lockfile advice.
+                instead = "" if source.kind == "script" else ", so check a lockfile instead"
                 if not source.pypi_only:
+                    what = "the script" if source.kind == "script" else "the project"
                     raise SourceError(
-                        f"{source.label}: the project configures an installer index or source; "
-                        "--deps uses only PyPI, so check a lockfile instead"
+                        f"{source.label}: {what} configures an installer index or source; "
+                        f"--deps uses only PyPI{instead}"
                     )
                 if (env := origin.index_env()) is not None:
                     raise SourceError(
-                        f"{source.label}: {env} may point pip or uv at another index, and --deps uses only PyPI, "
-                        "so check a lockfile instead"
+                        f"{source.label}: {env} may point pip or uv at another index, and --deps uses only PyPI"
+                        + instead
                     )
             # Wheel metadata files are cached on disk like pinned lookups: --online asks again, --no-cache skips it.
             resolver = Resolver(read_cache=not (args.no_cache or args.online), write_cache=not args.no_cache)
@@ -1953,6 +2093,11 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 raise SourceError(
                     f"{offline_how}: --conda-forge would look packages up on anaconda.org; "
                     f"drop --conda-forge, or {undo_offline(offline_how)}"
+                )
+            if args.piwheels:
+                raise SourceError(
+                    f"{offline_how}: --piwheels would look packages up on piwheels.org; "
+                    f"drop --piwheels, or {undo_offline(offline_how)}"
                 )
             if args.suggest:
                 raise SourceError(
@@ -2006,8 +2151,13 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             if source.deps_paths is None:
                 print(
                     f"wheelgap: note: {source.label} lists direct dependencies only; "
-                    "their own dependencies aren't checked (use a lockfile for that, or add --deps for PyPI), "
-                    "and ranges were checked at the newest matching release",
+                    + (
+                        "their own dependencies aren't checked "
+                        "(add --deps to check what the script installs from PyPI), "
+                        if source.kind == "script"
+                        else "their own dependencies aren't checked (use a lockfile for that, or add --deps for PyPI), "
+                    )
+                    + "and ranges were checked at the newest matching release",
                     file=sys.stderr,
                 )
             if source.requires_python and not quiet:  # the answer is right either way, so -q drops these
@@ -2178,6 +2328,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 file=sys.stderr,
             )
     conda_forge = conda_forge_hints(gaps, targets, sources, index_url, quiet, cached) if args.conda_forge else {}
+    pi_wheels = piwheels_hints(gaps, targets, sources, index_url, quiet, cached) if args.piwheels else {}
     # None: not asked for. Like the hints above, it never changes a status or the exit code.
     suggestions = version_suggestions(gaps, targets, sources, index_url, quiet) if args.suggest else None
     # With --fail-on missing, source builds are accepted; missing and unknown packages still fail. Gaps on
@@ -2269,6 +2420,12 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         else None
     )
 
+    if args.print_gap_wheel_snippet:  # one input of gapwheels.SNIPPET_KINDS, checked when it was read
+        multi_py = len({t.python for t in targets}) > 1
+        if snippet := gapwheels.project_snippet_lines(fills or [], sources[0], multi_py):
+            print("\n".join(snippet))
+        return code
+
     issues_urls = explain_issues_urls(rows, sources, index_url) if args.explain else None
 
     if args.junit is not None:  # an empty PATH (an unset CI variable) is an error, not "no report"
@@ -2281,6 +2438,13 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     if args.sarif is not None:  # an empty PATH is an error, as for --junit
         try:
             write_sarif(args.sarif, rows, targets, sources, fail_on, advisory)
+        except OSError as e:
+            print(f"wheelgap: error: {e}", file=sys.stderr)
+            return input_error_json(e) if args.json else 2
+
+    if args.gitlab_code_quality is not None:  # written even when the check fails; an empty PATH is an error
+        try:
+            write_codequality(args.gitlab_code_quality, rows, targets, sources, fail_on, advisory)
         except OSError as e:
             print(f"wheelgap: error: {e}", file=sys.stderr)
             return input_error_json(e) if args.json else 2
@@ -2331,6 +2495,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 dropped,
                 issues_urls=issues_urls,
                 gap_wheels=fills,
+                pi_wheels=pi_wheels,
             )
         )
         return code
@@ -2357,6 +2522,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                         suggestions=suggestions,
                         dropped=dropped,
                         issues_urls=issues_urls,
+                        pi_wheels=pi_wheels,
                     ),
                     *gapwheels.markdown_lines(fills or [], multi_py),
                 ]
@@ -2422,6 +2588,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 row_builds,
                 issues_urls=issues_urls,
                 published_wheels=fills,
+                pi_wheels=pi_wheels,
             ):
                 print(ln)
 
