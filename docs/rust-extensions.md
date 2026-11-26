@@ -28,8 +28,8 @@ runner; the Linux rows need both a glibc (manylinux) and a musl
 | Linux x86_64 (musllinux) | `ubuntu-latest` (musl container) | `musl-x86_64` |
 | Linux aarch64 (manylinux) | `ubuntu-24.04-arm`, or QEMU | `linux-aarch64` |
 | Linux aarch64 (musllinux) | `ubuntu-24.04-arm` (musl container) | `musl-aarch64` |
-| macOS x86_64 | `macos-13` | `macos-x86_64` |
-| macOS arm64 | `macos-14` or newer | `macos-arm64` |
+| macOS x86_64 | `macos-15-intel` | `macos-x86_64` |
+| macOS arm64 | `macos-15` or newer | `macos-arm64` |
 | Windows x64 | `windows-latest` | `win-amd64` |
 | Windows arm64 | `windows-11-arm` | `win-arm64` |
 
