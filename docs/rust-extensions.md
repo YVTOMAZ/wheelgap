@@ -34,18 +34,23 @@ runner; the Linux rows need both a glibc (manylinux) and a musl
 | Windows arm64 | `windows-11-arm` | `win-arm64` |
 
 Use [PyO3/maturin-action](https://github.com/PyO3/maturin-action) to drive
-maturin on each runner. A minimal build step:
+maturin on each runner. A minimal build step for the Linux rows:
 
 ```yaml
 - uses: PyO3/maturin-action@v1
   with:
     command: build
-    args: --release -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14 -i python3.14t
+    manylinux: auto  # musllinux_1_2 for the musl rows
+    args: --release --out dist -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14 -i python3.14t
 ```
 
-maturin and the Action handle the manylinux container and cross-compilation;
-see the Action's README for `target`, `manylinux`, `container` and
-`rust-toolchain`, and the [maturin book](https://www.maturin.rs/) for local
+`--out dist` matters: maturin writes to `target/wheels/` by default, and the
+check below reads `dist/`. With `manylinux` set, the Action builds inside a
+manylinux (or musllinux) container that already has these Pythons; without
+it, it builds on the runner itself. The macOS and Windows runners don't have
+every Python, so install them first (for example `actions/setup-python` with
+each version, including `3.14t`). See the Action's README for `target`,
+`manylinux`, `container` and `rust-toolchain`, and the [maturin book](https://www.maturin.rs/) for local
 builds and `maturin generate-ci`. Linking instead of repeating them keeps
 this page short.
 
@@ -55,7 +60,7 @@ Pass the interpreters explicitly with `-i` / `--interpreter` instead of
 `--find-interpreter`, so the set you ship is the set you check:
 
 ```bash
-maturin build --release \
+maturin build --release --out dist \
   -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14 -i python3.14t
 ```
 
@@ -68,7 +73,13 @@ maturin build --release \
 
 ## Check before you publish
 
-Run wheelgap on the `dist/` folder before uploading, with the Pythons and
+Each runner builds only its own platform's wheel, so run the check in the
+job that publishes, after collecting every build job's wheels (and the sdist,
+from `maturin sdist --out dist`, if you ship one) into one `dist/` folder, for
+example with `actions/download-artifact` and `merge-multiple: true`. Checked
+inside a single build job, every other platform would count as dropped.
+
+Run wheelgap on that `dist/` folder before uploading, with the Pythons and
 targets you actually ship:
 
 ```bash
@@ -78,7 +89,7 @@ uvx wheelgap --dist dist/ -p 3.10 -p 3.11 -p 3.12 -p 3.13 -p 3.14 -p 3.14t \
 
 It checks each file in `dist/` against the targets, compares with the last
 release on PyPI, and fails if a target you had a wheel for got none this
-time. In GitHub Actions the same check is the `dist` input:
+time, or if any target has no wheel at all (as a lockfile gap would). In GitHub Actions the same check is the `dist` input:
 
 ```yaml
 - uses: wheelgap/wheelgap@v0.14.0
