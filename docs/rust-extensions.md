@@ -41,7 +41,7 @@ maturin on each runner. A minimal build step for the Linux rows:
   with:
     command: build
     manylinux: auto  # musllinux_1_2 for the musl rows
-    args: --release --out dist -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14 -i python3.14t
+    args: --release --out dist -i python3.11 -i python3.12 -i python3.13 -i python3.14 -i python3.15 -i python3.14t -i python3.15t
 ```
 
 `--out dist` matters: maturin writes to `target/wheels/` by default, and the
@@ -49,7 +49,7 @@ check below reads `dist/`. With `manylinux` set, the Action builds inside a
 manylinux (or musllinux) container that already has these Pythons; without
 it, it builds on the runner itself. The macOS and Windows runners don't have
 every Python, so install them first (for example `actions/setup-python` with
-each version, including `3.14t`). See the Action's README for `target`,
+each version, including `3.14t` and `3.15t`). See the Action's README for `target`,
 `manylinux`, `container` and `rust-toolchain`, and the [maturin book](https://www.maturin.rs/) for local
 builds and `maturin generate-ci`. Linking instead of repeating them keeps
 this page short.
@@ -61,13 +61,17 @@ Pass the interpreters explicitly with `-i` / `--interpreter` instead of
 
 ```bash
 maturin build --release --out dist \
-  -i python3.10 -i python3.11 -i python3.12 -i python3.13 -i python3.14 -i python3.14t
+  -i python3.11 -i python3.12 -i python3.13 -i python3.14 -i python3.15 -i python3.14t -i python3.15t
 ```
+
+Start at 3.11 if you ship `win-arm64`: CPython has no Windows ARM64 build
+before 3.11, so a 3.10 in the list fails the `windows-11-arm` job and leaves
+`3.10 win-arm64` as a gap in the check below.
 
 !!! note
     An `abi3` wheel does not install on a free-threaded interpreter:
     free-threaded CPython needs `cp314-cp314t` wheels (or `abi3t` on 3.15+).
-    If you ship `abi3` only, pass `3.14t` explicitly so the gap shows up before
+    If you ship `abi3` only, pass each free-threaded Python (`3.14t`, `3.15t`) so the gap shows up before
     release, not in a user's install. See
     [Wheels on free-threaded Python](free-threading.md).
 
@@ -83,7 +87,7 @@ Run wheelgap on that `dist/` folder before uploading, with the Pythons and
 targets you actually ship:
 
 ```bash
-uvx wheelgap --dist dist/ -p 3.10 -p 3.11 -p 3.12 -p 3.13 -p 3.14 -p 3.14t \
+uvx wheelgap@latest --dist dist/ -p 3.11 -p 3.12 -p 3.13 -p 3.14 -p 3.15 -p 3.14t -p 3.15t \
   -t linux-x86_64,linux-aarch64,musl-x86_64,musl-aarch64,macos-x86_64,macos-arm64,win-amd64,win-arm64
 ```
 
@@ -95,7 +99,7 @@ time, or if any target has no wheel at all (as a lockfile gap would). In GitHub 
 - uses: wheelgap/wheelgap@v0.14.0
   with:
     dist: dist
-    args: -p 3.10 -p 3.11 -p 3.12 -p 3.13 -p 3.14 -p 3.14t -t linux-x86_64,linux-aarch64,musl-x86_64,musl-aarch64,macos-x86_64,macos-arm64,win-amd64,win-arm64
+    args: -p 3.11 -p 3.12 -p 3.13 -p 3.14 -p 3.15 -p 3.14t -p 3.15t -t linux-x86_64,linux-aarch64,musl-x86_64,musl-aarch64,macos-x86_64,macos-arm64,win-amd64,win-arm64
 ```
 
 See [Before a release](ci.md#before-a-release) and
