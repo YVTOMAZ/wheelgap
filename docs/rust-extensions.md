@@ -68,6 +68,11 @@ Start at 3.11 if you ship `win-arm64`: CPython has no Windows ARM64 build
 before 3.11, so a 3.10 in the list fails the `windows-11-arm` job and leaves
 `3.10 win-arm64` as a gap in the check below.
 
+Only list Pythons your PyO3 version supports. PyO3 checks the interpreter it
+builds for and refuses a newer CPython than it knows, so with an older PyO3
+the `3.15`/`3.15t` builds fail. Upgrade PyO3 first (its changelog says which
+Pythons each release supports), or leave those versions out until you do.
+
 !!! note
     An `abi3` wheel does not install on a free-threaded interpreter:
     free-threaded CPython needs `cp314-cp314t` wheels (or `abi3t` on 3.15+).
